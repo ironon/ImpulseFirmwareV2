@@ -367,6 +367,37 @@ static bool process_step_data(struct bt_le_cs_subevent_step *local_step,
 	return true;
 }
 
+/*
+ * Distance-estimation cost and context, MEASURED rather than assumed.
+ *
+ * cs_de_calc() runs a 512-point FFT per procedure, ~10 times a second, in
+ * whichever thread delivers the RAS ranging data. If that thread is
+ * cooperative it cannot be preempted by MPSL Work (cooperative -10 here), and
+ * SoftDevice Controller asserts are typically timing violations. The watch hit
+ * SDC assert 23/587 twice on 2026-09-12. This logs the thread once and the
+ * worst-case duration whenever it grows, so it costs nothing per call.
+ */
+static uint32_t impulse_de_max_us;
+static bool impulse_de_thread_logged;
+
+static void impulse_de_note_duration(int64_t ticks)
+{
+	uint32_t us = (uint32_t)k_ticks_to_us_ceil64((uint64_t)ticks);
+
+	if (!impulse_de_thread_logged) {
+		const char *name = k_thread_name_get(k_current_get());
+
+		impulse_de_thread_logged = true;
+		LOG_INF("cs_de_calc runs on thread '%s' (priority %d)",
+			name != NULL ? name : "?",
+			k_thread_priority_get(k_current_get()));
+	}
+	if (us > impulse_de_max_us) {
+		impulse_de_max_us = us;
+		LOG_INF("cs_de_calc worst case so far: %u us", us);
+	}
+}
+
 static void ranging_data_cb(struct bt_conn *conn, uint16_t ranging_counter, int err)
 {
 	ARG_UNUSED(conn);
@@ -428,7 +459,10 @@ static void ranging_data_cb(struct bt_conn *conn, uint16_t ranging_counter, int 
 
 	k_sem_give(&sem_local_steps);
 
+	int64_t de_t0 = k_uptime_ticks();
 	cs_de_quality_t quality = cs_de_calc(&m_cs_de_report);
+
+	impulse_de_note_duration(k_uptime_ticks() - de_t0);
 
 	if (quality == CS_DE_QUALITY_OK) {
 		for (uint8_t ap = 0; ap < m_cs_de_report.n_ap; ap++) {

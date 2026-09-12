@@ -17,6 +17,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/linker/section_tags.h>
 #include <zephyr/sys/reboot.h>
 
 #include "fatal.h"
@@ -157,6 +158,35 @@ static int64_t g_utc_base;
 static int64_t g_utc_base_uptime_ms;
 
 /*
+ * WALL CLOCK RETAINED ACROSS A WARM RESET.
+ *
+ * The flash save (IMPULSE_CLOCK_SAVE_INTERVAL_S) is written once a minute, so
+ * a reset restored a clock up to a minute stale. That was tolerable while
+ * resets were rare. It is not now: a fatal error deliberately REBOOTS (fatal.c),
+ * and on 2026-09-12 a SoftDevice Controller assert did exactly that ~43 s into
+ * a Sunrise Lock window. The restored clock came back 45 s slow — the watch
+ * then stayed in ENFORCEMENT for 45 s past the window's real end, which looked
+ * exactly like a failure to exit the window, and every window after it would
+ * have been shifted the same way.
+ *
+ * This mirror is written every loop pass (a RAM write, free) and lives in
+ * .noinit, which startup never zeroes. After a crash, a watchdog reset or the
+ * reset button the RAM is intact, and the clock comes back within about a
+ * second: the last second the loop saw, plus the time since boot. After a
+ * power loss the magic is garbage and the flash save is the fallback, exactly
+ * as before.
+ */
+#define RETAINED_CLOCK_MAGIC 0x434C4B52U /* "RKLC" */
+
+struct retained_clock {
+	uint32_t magic;
+	uint32_t magic_inv; /* ~magic: random RAM matching both is ~2^-64 */
+	int64_t utc;
+};
+
+static struct retained_clock g_retained_clock __noinit;
+
+/*
  * Forces an immediate condition check rather than waiting out a poll interval.
  * Set on window entry, and (once the IMU is wired) on a motion interrupt.
  *
@@ -209,6 +239,8 @@ static void clock_show_work_handler(struct k_work *work)
 	(void)impulse_led_ring_clear();
 }
 
+static bool status_ring_active(void);
+
 static void on_button(enum impulse_button_event ev)
 {
 	switch (ev) {
@@ -217,7 +249,13 @@ static void on_button(enum impulse_button_event ev)
 		LOG_INF("button: SHORT");
 		/* v3 §6.2: the ring is dark in DORMANT; a short press lights
 		 * the analog clock for CLOCK_SHOW_MS and then clears it. This
-		 * inverts v2 §5.7.2, which latched the clock through sleep. */
+		 * inverts v2 §5.7.2, which latched the clock through sleep.
+		 * Status colours take priority over the clock (also §6.2), so
+		 * during a window a press leaves the red/green status alone. */
+		if (status_ring_active()) {
+			break;
+		}
+
 		uint16_t minute;
 
 		impulse_local_from_utc(now_utc(), g_tz_offset_minutes, NULL,
@@ -968,10 +1006,13 @@ static K_WORK_DEFINE(g_sysworkq_probe, sysworkq_probe_handler);
  * The ring is only written when the wanted frame changes. A write is a full
  * SPI transfer of all twelve pixels and this runs every loop pass; resending
  * an identical frame ten times a second would be pure waste on a bus the
- * clock display also uses. The short-press clock owns the ring while its
- * timer is pending, and its handler clears the ring on the system workqueue —
- * so the cached frame is invalidated then, and the status is re-sent once the
- * clock has handed the ring back.
+ * clock display also uses.
+ *
+ * PRIORITY (v3 §6.2): status beats the clock. During a window a short press
+ * does not draw the time, and a clock already showing when a window begins is
+ * cancelled and overwritten — its timer would otherwise clear the status frame
+ * a few seconds later. Outside a window the clock owns the ring while its
+ * timer runs, and dark is re-asserted once it has cleared.
  */
 #define STATUS_RING_BRIGHTNESS 40
 #define STATUS_RING_FLASH_MS   500
@@ -983,33 +1024,60 @@ enum status_ring_frame {
 	STATUS_RING_GREEN_OFF,
 };
 
-static void update_status_ring(int64_t now_ms)
+static void status_ring_wanted(bool *alarm, bool *compliant)
 {
-	static int last = -1;
-	bool alarm = false;
-	bool compliant = false;
-	int want;
-
-	if (k_work_delayable_busy_get(&clock_off_work) != 0) {
-		last = -1;
-		return;
-	}
+	*alarm = false;
+	*compliant = false;
 
 #if defined(CONFIG_IMPULSE_ROLE_ANCHOR)
 	if (impulse_anchor_beep_state()->active) {
-		alarm = true;
+		*alarm = true;
 	} else if (impulse_app_anchor_in_active_event()) {
-		compliant = true;
+		*compliant = true;
 	}
 #else
 	if (g_enf.state == IMPULSE_STATE_ENFORCEMENT) {
 		if (g_enf.condition_met) {
-			compliant = true;
+			*compliant = true;
 		} else {
-			alarm = true;
+			*alarm = true;
 		}
 	}
 #endif
+}
+
+static bool status_ring_active(void)
+{
+	bool alarm;
+	bool compliant;
+
+	status_ring_wanted(&alarm, &compliant);
+	return alarm || compliant;
+}
+
+static void update_status_ring(int64_t now_ms)
+{
+	static int last = -1;
+	bool alarm;
+	bool compliant;
+	int want;
+
+	status_ring_wanted(&alarm, &compliant);
+
+	if (k_work_delayable_busy_get(&clock_off_work) != 0) {
+		if (!alarm && !compliant) {
+			last = -1;
+			return;
+		}
+		/* A window began while the clock was up: status wins. If the
+		 * clear handler is already running it may still wipe the ring,
+		 * so redraw on a later pass rather than trusting the cache. */
+		if (k_work_cancel_delayable(&clock_off_work) != 0) {
+			last = -1;
+			return;
+		}
+		last = -1;
+	}
 
 	if (alarm) {
 		want = STATUS_RING_RED;
@@ -1163,7 +1231,20 @@ int main(void)
 		int64_t saved = 0;
 
 		(void)impulse_storage_load_wall_clock(&saved);
-		if (saved > IMPULSE_CLOCK_SANITY_FLOOR) {
+		if (g_retained_clock.magic == RETAINED_CLOCK_MAGIC &&
+		    g_retained_clock.magic_inv == ~RETAINED_CLOCK_MAGIC &&
+		    g_retained_clock.utc > IMPULSE_CLOCK_SANITY_FLOOR &&
+		    g_retained_clock.utc >= saved) {
+			/* Base at the boot instant: the retained second was the
+			 * last one before the reset, and everything since boot is
+			 * already counted by k_uptime_get(). */
+			g_utc_base = g_retained_clock.utc;
+			g_utc_base_uptime_ms = 0;
+			g_clock_restored = true;
+			LOG_WRN("clock RESTORED from retained RAM after a warm "
+				"reset (utc=%lld, ~1 s accuracy)",
+				g_retained_clock.utc);
+		} else if (saved > IMPULSE_CLOCK_SANITY_FLOOR) {
 			g_utc_base = saved;
 			g_utc_base_uptime_ms = k_uptime_get();
 			g_clock_restored = true;
@@ -1260,6 +1341,12 @@ int main(void)
 
 		last_tick = now_ms;
 		impulse_hw_watchdog_feed();
+
+		if (g_utc_base > IMPULSE_CLOCK_SANITY_FLOOR) {
+			g_retained_clock.utc = now_utc();
+			g_retained_clock.magic = RETAINED_CLOCK_MAGIC;
+			g_retained_clock.magic_inv = ~RETAINED_CLOCK_MAGIC;
+		}
 
 #if defined(CONFIG_IMPULSE_SYSWORKQ_WATCHDOG)
 		{
