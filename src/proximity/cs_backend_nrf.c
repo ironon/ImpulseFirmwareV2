@@ -120,6 +120,10 @@ static K_SEM_DEFINE(sem_security, 0, 1);
 static K_SEM_DEFINE(sem_ras_features, 0, 1);
 static K_SEM_DEFINE(sem_local_steps, 1, 1);
 static K_SEM_DEFINE(sem_distance_estimate_updated, 0, 1);
+/* Controller-CONFIRMED procedure state, from LE CS Procedure Enable Complete.
+ * Distinct from g_procedures_on, which only records that a request was sent. */
+static K_SEM_DEFINE(sem_procedures_disabled, 0, 1);
+static atomic_t g_cs_active;
 
 static K_MUTEX_DEFINE(distance_estimate_buffer_mutex);
 
@@ -686,6 +690,10 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 
 	LOG_INF("CS: peer lost (reason 0x%02X) — restarting engine", reason);
 
+	/* The link is gone, so are its procedures: release any teardown wait. */
+	atomic_set(&g_cs_active, 0);
+	k_sem_give(&sem_procedures_disabled);
+
 	/*
 	 * FREE THE RAS INITIATOR FIRST. bt_ras_rreq_alloc_and_assign_handles()
 	 * takes its OWN bt_conn_ref() (ras_rreq.c: rreq->conn =
@@ -824,6 +832,8 @@ static void procedure_enable_cb(struct bt_conn *conn,
 
 	if (status == BT_HCI_ERR_SUCCESS) {
 		if (params->state == 1) {
+			atomic_set(&g_cs_active, 1);
+			k_sem_reset(&sem_procedures_disabled);
 			LOG_INF("CS procedures enabled:\n"
 				" - config ID: %u\n"
 				" - antenna configuration index: %u\n"
@@ -842,6 +852,8 @@ static void procedure_enable_cb(struct bt_conn *conn,
 				params->procedure_count, params->max_procedure_len);
 		} else {
 			LOG_INF("CS procedures disabled.");
+			atomic_set(&g_cs_active, 0);
+			k_sem_give(&sem_procedures_disabled);
 		}
 	} else {
 		LOG_WRN("CS procedures enable failed. (HCI status 0x%02x)", status);
@@ -1167,6 +1179,53 @@ int impulse_cs_notify_watch_state(uint8_t command, const uint8_t *event_uuid)
 	return 0;
 }
 
+/*
+ * NEVER DISCONNECT WITH CS PROCEDURES STILL RUNNING.
+ *
+ * nrfxlib main — in no release yet — fixes DRGN-29669: "the controller could
+ * assert when an ACL connection with active CS procedures was disconnected."
+ * The watch hit SoftDevice Controller assert 23/587 twice on 2026-09-12 in
+ * that situation. And this engine did it deliberately at the end of every
+ * window: apply_ranging_state() only SENDS the disable, and the loop went
+ * straight to restart: and bt_conn_disconnect() without waiting for the
+ * controller to confirm it.
+ *
+ * So if the controller has confirmed procedures active, ask it to stop and
+ * wait for LE CS Procedure Enable Complete (state 0) before dropping the link.
+ * The timeout stops a controller that never answers from wedging the engine.
+ * A link that is LOST rather than closed cannot be sequenced like this at all,
+ * and still depends on the controller fix.
+ */
+#define IMPULSE_CS_DISABLE_WAIT_MS 2000
+
+static void procedures_off_before_disconnect(void)
+{
+	struct bt_le_cs_procedure_enable_param params = {
+		.config_id = CS_CONFIG_ID,
+		.enable = 0,
+	};
+	int err;
+
+	if (atomic_get(&g_cs_active) == 0) {
+		return;
+	}
+
+	/* A disable may already be in flight from apply_ranging_state(); a
+	 * second request then fails harmlessly, and the wait still catches the
+	 * first one's completion. */
+	err = bt_le_cs_procedure_enable(connection, &params);
+
+	if (k_sem_take(&sem_procedures_disabled,
+		       K_MSEC(IMPULSE_CS_DISABLE_WAIT_MS)) == 0 ||
+	    atomic_get(&g_cs_active) == 0) {
+		LOG_INF("CS: procedures confirmed off before disconnect");
+	} else {
+		LOG_WRN("CS: procedures still active %d ms after disable "
+			"(err %d) — disconnecting anyway",
+			IMPULSE_CS_DISABLE_WAIT_MS, err);
+	}
+}
+
 static void cs_engine_entry(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -1208,6 +1267,7 @@ restart:
 	 * stops ranging for the rest of the boot is a commitment that silently
 	 * stops being enforced, so the engine retries forever instead. */
 	if (connection != NULL) {
+		procedures_off_before_disconnect();
 		(void)bt_conn_disconnect(connection,
 					 BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		/* Same reference as in disconnected_cb — the engine tearing the
