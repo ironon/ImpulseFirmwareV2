@@ -17,6 +17,7 @@ SRC     = ../src/schedule/event.c \
           ../src/integrity/classify.c \
           ../src/integrity/integrity.c \
           ../src/enforcement/profiles.c \
+          ../src/enforcement/enforcement.c \
           ../src/proximity/proximity.c \
           ../src/proximity/cs_fuse.c
 TESTS   = test_main.c

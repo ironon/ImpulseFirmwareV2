@@ -1,0 +1,26 @@
+/*
+ * BLE <-> WiFi coexistence (PTA) for Board V1.
+ *
+ * The BM20C and the WM02C share the 2.4 GHz band and the four coex wires
+ * between them are ROUTED on this board — they are simply unused by default,
+ * which means the two radios currently transmit with nothing arbitrating
+ * between them. Pins read from the KiCad netlist (U8 <-> U7):
+ *
+ *   BT-COEX-REQ_11      H9   P1.09   -> PTA REQUEST
+ *   BT-COEX-STATUS0_10  K9   P1.31   -> PTA PRIORITY / direction
+ *   BT-COEX-GRANT_12    K4   P1.12   -> PTA GRANT
+ *   SW-CTRL1_14         K2   P3.10   -> STATUS1 (4-wire coex)
+ *
+ * Opt-in, because it is a hypothesis rather than a proven fix:
+ *   ./build.sh anchor --cs --wifi --coex
+ */
+/ {
+	nrf_radio_coex: nrf7002-coex {
+		compatible = "nordic,nrf7002-coex";
+		status = "okay";
+		req-gpios      = <&gpio1 9  GPIO_ACTIVE_HIGH>;
+		status0-gpios  = <&gpio1 31 GPIO_ACTIVE_HIGH>;
+		grant-gpios    = <&gpio1 12 GPIO_ACTIVE_HIGH>;
+		swctrl1-gpios  = <&gpio3 10 GPIO_ACTIVE_HIGH>;
+	};
+};

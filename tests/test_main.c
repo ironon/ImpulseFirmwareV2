@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "enforcement/enforcement.h"
 #include "enforcement/profiles.h"
 #include "integrity/classify.h"
 #include "integrity/integrity.h"
@@ -497,13 +498,17 @@ static void test_cs_fuse(void)
 	impulse_cs_burst_finish(&b, &m);
 	CHECK(m.result == IMPULSE_CS_OK, "clean burst succeeds");
 	CHECK(m.pbr_cm == 297, "raw estimator preserved");
-	CHECK(m.distance_cm >= 195 && m.distance_cm <= 210,
-	      "raw 297 cm calibrates to ~200 cm true");
+	/* Stated against the constant, not a number. Hard-coding the expected
+	 * output meant re-deriving the offset on real hardware (97 -> 72 cm,
+	 * BM20C<->BM20C, 2026-09-12) broke this check for a reason that had
+	 * nothing to do with the estimator. */
+	CHECK(m.distance_cm == ((297 - IMPULSE_CS_IFFT_OFFSET_CM) << 8) /
+				      IMPULSE_CS_IFFT_SLOPE_Q8,
+	      "raw ifft is calibrated by the offset and slope");
 
 	/* The calibration is what makes the §4.4 thresholds mean anything: an
-	 * uncalibrated 297 would read as beyond AWAY_ENTER_CM (350)? no — but
-	 * it would read 297 where the truth is 201, which is most of the way
-	 * across the 150 cm hysteresis band. */
+	 * uncalibrated reading is a whole offset too far, which is a large
+	 * fraction of the NEAR/AWAY hysteresis band. */
 	CHECK(IMPULSE_CS_IFFT_OFFSET_CM > 0, "offset calibration present");
 
 	/* Contact readings sit inside the near field and clamp to zero rather
@@ -623,6 +628,96 @@ static void test_cs_fuse(void)
 	}
 }
 
+/* ---- enforcement: every exit must settle the output profile -------------- */
+static void test_enforcement_outputs(void)
+{
+	struct impulse_enforcement_ctx ctx;
+	struct impulse_event e = mk_event(1, 0, 1440, 0);
+
+	e.criteria = IMPULSE_CRIT_GET_AWAY;
+	e.profile = IMPULSE_PROFILE_STRICT_BOTH;
+	e.donning_grace_s = 300;
+
+	/*
+	 * Regression, observed on hardware 2026-09-12. The donning grace
+	 * short-circuited check_condition with `condition_met = true; return`,
+	 * which skipped the profile transition at the bottom of the function.
+	 * profile_run kept motor_on = 1, and main() drives the pads from
+	 * profile_run every pass, so putting the watch on mid-alarm reported
+	 * cond_met=1 while the motor kept running for the rest of the window.
+	 */
+	impulse_enforcement_init(&ctx);
+	impulse_enforcement_enter(&ctx, &e, 1000, false);
+	CHECK(ctx.grace_deadline_utc == 0,
+	      "entering a window UNWORN opens no donning grace");
+
+	/* Unworn and near the anchor => getAway unmet => profile running. */
+	ctx.prox.have_verdict = true;
+	ctx.prox.verdict = IMPULSE_PROX_NEAR;
+	CHECK(impulse_enforcement_check_condition(&ctx, 1000, false, NULL,
+						  true) == false,
+	      "getAway while near is not met");
+	(void)impulse_enforcement_tick(&ctx, 100);
+	CHECK(ctx.profile_run.motor_on, "strict profile drives the motor");
+
+	/* Donning opens the grace. Output must stop on the same call. */
+	impulse_enforcement_set_worn(&ctx, true, 1010);
+	CHECK(impulse_enforcement_check_condition(&ctx, 1010, false, NULL,
+						  true) == true,
+	      "donning grace short-circuits to met");
+	CHECK(!ctx.profile_run.motor_on,
+	      "donning grace stops the motor, not just the verdict");
+	CHECK(!ctx.profile_run.buzzer_on, "donning grace stops the buzzer");
+	(void)impulse_enforcement_tick(&ctx, 100);
+	CHECK(!ctx.profile_run.motor_on, "a stopped profile stays stopped");
+
+	/* Grace expiry with the watch still near => alarm resumes. */
+	CHECK(impulse_enforcement_check_condition(&ctx, 1010 + 301, false,
+						  NULL, true) == false,
+	      "grace expiry re-evaluates the criterion");
+	(void)impulse_enforcement_tick(&ctx, 100);
+	CHECK(ctx.profile_run.motor_on, "alarm resumes after the grace");
+
+	/* Entering a window already wearing the watch DOES earn the grace. */
+	{
+		struct impulse_enforcement_ctx w;
+
+		impulse_enforcement_init(&w);
+		impulse_enforcement_enter(&w, &e, 1000, true);
+		CHECK(w.grace_deadline_utc == 1000 + 300,
+		      "entering a window WORN opens the donning grace");
+	}
+
+	/* A no-active-event exit must settle too. */
+	ctx.active = NULL;
+	CHECK(impulse_enforcement_check_condition(&ctx, 2000, false, NULL,
+						  true) == true,
+	      "no active event is met");
+	CHECK(!ctx.profile_run.motor_on, "no active event stops the motor");
+
+	/* phoneAway fail-open on a degraded link must settle too. */
+	e.criteria = IMPULSE_CRIT_PHONE_AWAY;
+	e.donning_grace_s = 0;
+	impulse_enforcement_init(&ctx);
+	impulse_enforcement_enter(&ctx, &e, 3000, true);
+	ctx.prox.have_verdict = true;
+	ctx.prox.verdict = IMPULSE_PROX_NEAR;
+	ctx.phone_near_since_utc = 1;
+	CHECK(impulse_enforcement_check_condition(
+		      &ctx, 3000 + IMPULSE_PHONE_AWAY_TOLERANCE_S + 1, false,
+		      NULL, true) == false,
+	      "phoneAway fires once the tolerance is exhausted");
+	(void)impulse_enforcement_tick(&ctx, 100);
+	CHECK(ctx.profile_run.motor_on, "phoneAway drives the motor");
+
+	ctx.prox.have_verdict = false; /* link degrades => fail open */
+	CHECK(impulse_enforcement_check_condition(&ctx, 3000, false, NULL,
+						  true) == true,
+	      "phoneAway fails open on a degraded link");
+	CHECK(!ctx.profile_run.motor_on,
+	      "phoneAway fail-open stops the motor");
+}
+
 int main(void)
 {
 	printf("impulse host tests\n\n");
@@ -635,6 +730,7 @@ int main(void)
 	test_profiles();
 	test_proximity();
 	test_cs_fuse();
+	test_enforcement_outputs();
 
 	printf("\n%d checks, %d failed\n", g_run, g_fail);
 	return g_fail == 0 ? 0 : 1;

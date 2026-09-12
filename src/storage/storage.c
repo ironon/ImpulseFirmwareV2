@@ -36,6 +36,7 @@ struct integ_hdr {
  * wall clock cannot accelerate a quarantine. Persisting the wall clock must
  * not be allowed to contaminate that. */
 #define KEY_WALL      KEY_ROOT "/wall"
+#define KEY_BOOTS     KEY_ROOT "/boots"
 #define KEY_WIFI      KEY_ROOT "/wifi"
 #define KEY_ANCHORIP  KEY_ROOT "/aip"
 #define KEY_ANCHORIPN KEY_ROOT "/aipn"
@@ -49,6 +50,7 @@ static struct impulse_schedule *s_sched_target;
 static struct impulse_integrity *s_integ_target;
 static uint64_t *s_elapsed_target;
 static int64_t *s_wall_target;
+static uint32_t *s_boots_target;
 static struct impulse_wifi_cred *s_wifi_target;
 static struct impulse_anchor_ip *s_aip_target;
 static uint8_t s_aip_max;
@@ -61,6 +63,12 @@ static int load_cb(const char *key, size_t len, settings_read_cb read_cb,
 	ARG_UNUSED(param);
 	const char *next = NULL;
 
+	if (settings_name_steq(key, "boots", NULL) && s_boots_target != NULL) {
+		if (len != sizeof(*s_boots_target)) {
+			return 0;
+		}
+		return read_cb(cb_arg, s_boots_target, len) > 0 ? 0 : -EINVAL;
+	}
 	if (settings_name_steq(key, "wifi", NULL) && s_wifi_target != NULL) {
 		if (len != sizeof(*s_wifi_target)) {
 			return 0;
@@ -325,6 +333,22 @@ int impulse_storage_load_integrity(struct impulse_integrity *ig)
 	s_integ_target = ig;
 	err = settings_load_subtree_direct(KEY_ROOT, load_cb, NULL);
 	s_integ_target = NULL;
+	return err;
+}
+
+int impulse_storage_save_boot_count(uint32_t n)
+{
+	return settings_save_one(KEY_BOOTS, &n, sizeof(n));
+}
+
+int impulse_storage_load_boot_count(uint32_t *n)
+{
+	int err;
+
+	*n = 0;
+	s_boots_target = n;
+	err = settings_load_subtree_direct(KEY_ROOT, load_cb, NULL);
+	s_boots_target = NULL;
 	return err;
 }
 

@@ -172,63 +172,6 @@ static struct k_thread udp_rx_thread;
  * re-assertion able to restart an alarm this anchor lost to its own reboot or
  * max_beep_minutes timeout, without ever starting one that should not run.
  */
-static void handle_packet(const uint8_t *pkt, size_t len)
-{
-	if (len != IMPULSE_UDP_PACKET_LEN) {
-		LOG_WRN("udp: ignoring %u-byte datagram (expected %d)",
-			(unsigned)len, IMPULSE_UDP_PACKET_LEN);
-		return;
-	}
-
-	uint8_t command = pkt[0];
-	const uint8_t *event_uuid = &pkt[1 + IMPULSE_UUID_LEN];
-
-	if (command == IMPULSE_UDP_WATCH_WORN) {
-		/* §4.6: stop all beeping immediately. Unconditional — a watch
-		 * saying "I am back on" must never be second-guessed. */
-		LOG_INF("udp: WATCH_WORN — stopping alarm");
-		impulse_anchor_beep_stop();
-		return;
-	}
-
-	if (command != IMPULSE_UDP_WATCH_REMOVED) {
-		return;
-	}
-
-	const struct impulse_event *ev = impulse_app_find_active_event(event_uuid);
-
-	if (ev == NULL) {
-		LOG_DBG("udp: WATCH_REMOVED for an event that is not active here");
-		return;
-	}
-
-	/* Is THIS anchor in the event's beepAnchors? If not, ignore (§4.6.5). */
-	const uint8_t *me = impulse_anchor_uuid();
-	bool mine = false;
-
-	for (uint8_t i = 0; i < ev->beep_anchor_count; i++) {
-		if (memcmp(ev->beep_anchors[i], me, IMPULSE_UUID_LEN) == 0) {
-			mine = true;
-			break;
-		}
-	}
-	if (!mine) {
-		LOG_DBG("udp: WATCH_REMOVED but this anchor is not in beepAnchors");
-		return;
-	}
-
-	uint8_t profile = ev->anchor_profile;
-
-	if (profile > IMPULSE_ANCHOR_PROFILE_HARD) {
-		/* §4.11.1 precedent: a missing anchorProfile defaults to MEDIUM
-		 * rather than silently not alarming. A commitment whose alarm
-		 * is dead because a field was omitted is the worst outcome. */
-		profile = IMPULSE_ANCHOR_PROFILE_MEDIUM;
-	}
-
-	impulse_anchor_beep_start(profile);
-}
-
 static void udp_rx_entry(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -272,7 +215,7 @@ static void udp_rx_entry(void *a, void *b, void *c)
 				LOG_WRN("udp: recv failed (%d), re-opening", errno);
 				break;
 			}
-			handle_packet(buf, (size_t)n);
+			impulse_anchor_handle_command(buf, (size_t)n);
 		}
 
 		(void)zsock_close(sock);

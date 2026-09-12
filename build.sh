@@ -26,11 +26,12 @@ SUFFIX=""
 # CS is the initiator on the watch and the reflector on the anchor — the same
 # flag, because "does this build do channel sounding" is the question a caller
 # actually has.
-WANT_CS=0; WANT_WIFI=0; WEST_ARGS=()
+WANT_CS=0; WANT_WIFI=0; WANT_COEX=0; WEST_ARGS=()
 for a in "$@"; do
   case "$a" in
     --cs)   WANT_CS=1 ;;
     --wifi) WANT_WIFI=1 ;;
+    --coex) WANT_COEX=1 ;;
     *)      WEST_ARGS+=("$a") ;;
   esac
 done
@@ -52,6 +53,15 @@ if [ "$WANT_WIFI" = 1 ]; then
   # command answers "No default interface found for type: STA".
   SBFLAGS+=(-DSB_CONFIG_WIFI_NRF70=y -DSB_CONFIG_WIFI_NRF70_SYSTEM_MODE=y)
   SUFFIX="${SUFFIX}wifi"
+fi
+
+if [ "$WANT_COEX" = 1 ]; then
+  if [ "$WANT_WIFI" != 1 ]; then
+    echo "--coex requires --wifi"; exit 2
+  fi
+  CONFS="$CONFS;coex.conf"
+  OVERLAYS="$OVERLAYS;$HERE/coex.overlay"
+  SUFFIX="${SUFFIX}coex"
 fi
 
 BUILD_DIR="$HERE/build-$ROLE${SUFFIX:+-$SUFFIX}"

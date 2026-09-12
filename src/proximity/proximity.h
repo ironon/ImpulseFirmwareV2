@@ -144,6 +144,13 @@ int impulse_cs_backend_start(void);
  * it is a no-op unless the state changes.
  */
 void impulse_cs_set_ranging(bool on);
+
+/*
+ * Send a §6.1 escalation over the CS link. Returns 0 if handed to the stack,
+ * -ENOTCONN when there is no link to the anchor — which is the signal to fall
+ * back to WiFi.
+ */
+int impulse_cs_notify_watch_state(uint8_t command, const uint8_t *event_uuid);
 void impulse_cs_backend_set(const struct impulse_cs_backend *backend);
 
 #endif /* IMPULSE_PROXIMITY_H_ */

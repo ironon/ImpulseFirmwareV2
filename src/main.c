@@ -25,6 +25,8 @@
 #include "schedule/schedule.h"
 #include "storage/storage.h"
 #include "identity.h"
+/* Shared §6.1 command constants — wire format, not role-specific. */
+#include "anchor/anchor.h"
 #if defined(CONFIG_IMPULSE_NET)
 #include "net/net_udp.h"
 #include "net/net_wifi.h"
@@ -143,6 +145,10 @@ static int16_t g_tz_offset_minutes;
  */
 static int8_t g_worn_override = -1;
 
+/* When the WiFi fallback started, so it can be given up on. 0 = not trying. */
+static int64_t g_wifi_escalate_since_ms;
+static bool g_wifi_escalate_gave_up;
+
 static bool g_clock_restored;
 static int64_t g_utc_base;
 static int64_t g_utc_base_uptime_ms;
@@ -242,6 +248,75 @@ static void on_button(enum impulse_button_event ev)
 	}
 }
 
+
+#if defined(CONFIG_IMPULSE_ROLE_WATCH) && \
+	(defined(CONFIG_IMPULSE_CS_BACKEND) || defined(CONFIG_IMPULSE_NET))
+/*
+ * Tell this event's anchors that the watch has been removed (or put back on).
+ *
+ * BLE FIRST, WiFi as fallback — and never both, because BLE and WiFi cannot
+ * run together on Board V1 and the FCC grant is expected to require they do
+ * not. The two are naturally exclusive: WiFi is only reached for when there is
+ * no BLE link, which is precisely the out-of-range case.
+ */
+static void escalate_to_anchors(uint8_t command,
+				const struct impulse_event *ev)
+{
+	if (ev == NULL || ev->beep_anchor_count == 0U) {
+		return;
+	}
+
+#if defined(CONFIG_IMPULSE_CS_BACKEND)
+	if (impulse_cs_notify_watch_state(command, ev->id) == 0) {
+		/* Reached it over the ranging link. WiFi is not needed, and
+		 * asking for it would put two radios on the air at once. */
+#if defined(CONFIG_IMPULSE_NET)
+		impulse_wifi_request(false);
+#endif
+		g_wifi_escalate_since_ms = 0;
+		g_wifi_escalate_gave_up = false;
+		return;
+	}
+#endif
+
+	/*
+	 * No BLE link — the watch is out of range of the anchor. THIS is the
+	 * case WiFi exists for: Sunrise Lock's known bypass is to carry the
+	 * watch out of range and go back to bed, and BLE by construction
+	 * cannot report an absence it cannot see.
+	 */
+#if !defined(CONFIG_IMPULSE_NET)
+	/* No WiFi in this build: BLE was the only carrier and it is not
+	 * available. Say so rather than failing mutely. */
+	LOG_DBG("escalation 0x%02x: no BLE link and no WiFi in this build",
+		command);
+	return;
+#else
+	int64_t now_ms = k_uptime_get();
+
+	if (g_wifi_escalate_since_ms == 0) {
+		g_wifi_escalate_since_ms = now_ms;
+		g_wifi_escalate_gave_up = false;
+	}
+
+	if ((now_ms - g_wifi_escalate_since_ms) >
+	    ((int64_t)CONFIG_IMPULSE_ESCALATION_WIFI_GIVEUP_MIN * 60 * 1000)) {
+		if (!g_wifi_escalate_gave_up) {
+			g_wifi_escalate_gave_up = true;
+			LOG_WRN("escalation: no anchor over BLE or WiFi for "
+				"%d min — giving up (out of scope)",
+				CONFIG_IMPULSE_ESCALATION_WIFI_GIVEUP_MIN);
+			impulse_wifi_request(false);
+		}
+		return;
+	}
+
+	impulse_wifi_request(true);
+	(void)impulse_udp_send_to_anchors(command, ev);
+#endif /* CONFIG_IMPULSE_NET */
+}
+#endif
+
 /* Recompute today's plan and pick up the currently active event. */
 static void refresh_active_event(void)
 {
@@ -266,7 +341,11 @@ static void refresh_active_event(void)
 		impulse_motor_set(false);
 		impulse_buzzer_set(false);
 #if defined(CONFIG_IMPULSE_NET) && defined(CONFIG_IMPULSE_ROLE_WATCH)
+#if defined(CONFIG_IMPULSE_NET)
 		impulse_wifi_request(false);
+#endif
+		g_wifi_escalate_since_ms = 0;
+		g_wifi_escalate_gave_up = false;
 #endif
 		return;
 	}
@@ -295,8 +374,7 @@ static void refresh_active_event(void)
 	 */
 	if (!g_enf.worn) {
 		LOG_INF("window opened with the watch UNWORN — escalating");
-		(void)impulse_udp_send_to_anchors(IMPULSE_UDP_WATCH_REMOVED,
-						  active);
+		escalate_to_anchors(IMPULSE_CMD_WATCH_REMOVED, active);
 	}
 #endif
 }
@@ -932,6 +1010,17 @@ int main(void)
 	}
 
 	{
+		/* Boot counter: says outright whether this board is resetting,
+		 * which a wiped RTT buffer can never tell you. */
+		uint32_t boots = 0;
+
+		(void)impulse_storage_load_boot_count(&boots);
+		boots++;
+		(void)impulse_storage_save_boot_count(boots);
+		LOG_WRN("BOOT #%u", boots);
+	}
+
+	{
 		/*
 		 * Restore the wall clock. A watch that boots at 1970 matches no
 		 * window and enforces nothing, silently — so a reset, or a flat
@@ -1100,7 +1189,8 @@ int main(void)
 				(void)impulse_enforcement_check_condition(
 					&g_enf, now_utc(), false, NULL, true);
 
-#if defined(CONFIG_IMPULSE_NET) && defined(CONFIG_IMPULSE_ROLE_WATCH)
+#if defined(CONFIG_IMPULSE_ROLE_WATCH) && \
+	(defined(CONFIG_IMPULSE_CS_BACKEND) || defined(CONFIG_IMPULSE_NET))
 				/*
 				 * §5.5.1 RE-ASSERTION. WATCH_REMOVED is sent on
 				 * EVERY poll while the watch stays unworn and
@@ -1126,17 +1216,39 @@ int main(void)
 					now_utc() < g_enf.grace_deadline_utc;
 
 				if (!g_enf.worn && !in_grace) {
-					(void)impulse_udp_send_to_anchors(
-						IMPULSE_UDP_WATCH_REMOVED,
+					escalate_to_anchors(
+						IMPULSE_CMD_WATCH_REMOVED,
 						g_enf.active);
 				}
 #endif
 			}
 
-			if (impulse_enforcement_tick(&g_enf, dt)) {
-				impulse_motor_set(g_enf.profile_run.motor_on);
-				impulse_buzzer_set(g_enf.profile_run.buzzer_on);
-			}
+			/*
+			 * Drive the pins from the profile state EVERY pass,
+			 * not only when tick() reports a change.
+			 *
+			 * tick() returns "did the output state change", and for
+			 * a CONTINUOUS step it returns false forever by design —
+			 * the caller is expected to stop it, not to be told
+			 * about it. Gating the GPIO writes on that return value
+			 * therefore meant every profile whose step is
+			 * CONTINUOUS never drove its outputs AT ALL: the run
+			 * struct said motor_on = 1 while the pad sat low.
+			 *
+			 * That is all three STRICT profiles — so the strictest
+			 * enforcement level in the product was the only one
+			 * that did nothing, and the duty-cycled profiles
+			 * masked it because their step changes happened to
+			 * produce the edge this needed. Observed 2026-09-12:
+			 * cond_met=0, profile_run.motor_on=1, P3 OUT bit 3 low
+			 * across 120 samples.
+			 *
+			 * Writing unconditionally is two GPIO writes per 100 ms
+			 * tick and makes the whole class of bug unreachable.
+			 */
+			(void)impulse_enforcement_tick(&g_enf, dt);
+			impulse_motor_set(g_enf.profile_run.motor_on);
+			impulse_buzzer_set(g_enf.profile_run.buzzer_on);
 		} else {
 			/*
 			 * NOT ENFORCING => NOTHING DRIVEN. This is a
@@ -1206,12 +1318,13 @@ int main(void)
 					impulse_enforcement_set_worn(
 						&g_enf, forced, now_utc());
 					g_force_poll = true;
-#if defined(CONFIG_IMPULSE_NET) && defined(CONFIG_IMPULSE_ROLE_WATCH)
+#if defined(CONFIG_IMPULSE_ROLE_WATCH) && \
+	(defined(CONFIG_IMPULSE_CS_BACKEND) || defined(CONFIG_IMPULSE_NET))
 					if (g_enf.state ==
 					    IMPULSE_STATE_ENFORCEMENT) {
-						(void)impulse_udp_send_to_anchors(
-							forced ? IMPULSE_UDP_WATCH_WORN
-							       : IMPULSE_UDP_WATCH_REMOVED,
+						escalate_to_anchors(
+							forced ? IMPULSE_CMD_WATCH_WORN
+							       : IMPULSE_CMD_WATCH_REMOVED,
 							g_enf.active);
 					}
 #endif
@@ -1243,7 +1356,8 @@ int main(void)
 								     worn,
 								     now_utc());
 					g_force_poll = true;
-#if defined(CONFIG_IMPULSE_NET) && defined(CONFIG_IMPULSE_ROLE_WATCH)
+#if defined(CONFIG_IMPULSE_ROLE_WATCH) && \
+	(defined(CONFIG_IMPULSE_CS_BACKEND) || defined(CONFIG_IMPULSE_NET))
 					/*
 					 * §5.5.1. The EDGE is what starts the
 					 * escalation; the per-poll re-assert
@@ -1254,9 +1368,9 @@ int main(void)
 					 */
 					if (g_enf.state ==
 					    IMPULSE_STATE_ENFORCEMENT) {
-						(void)impulse_udp_send_to_anchors(
-							worn ? IMPULSE_UDP_WATCH_WORN
-							     : IMPULSE_UDP_WATCH_REMOVED,
+						escalate_to_anchors(
+							worn ? IMPULSE_CMD_WATCH_WORN
+							     : IMPULSE_CMD_WATCH_REMOVED,
 							g_enf.active);
 					}
 #endif
@@ -1307,7 +1421,7 @@ int main(void)
 		 * (tens of ppm) from the internal RC (whole percent) far more
 		 * reliably than reading a source register.
 		 */
-		if ((now_ms - last_beat) >= 10000) {
+		if ((now_ms - last_beat) >= 60000) {
 			last_beat = now_ms;
 			/* worn_delta and the charger pin ride along on the
 			 * heartbeat so a PASSIVE rtt.sh capture can verify the

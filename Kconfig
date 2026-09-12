@@ -47,6 +47,25 @@ config IMPULSE_NET
 	  so it deliberately rides WiFi rather than BLE, which by construction
 	  cannot outreach the thing it is trying to detect the absence of.
 
+config IMPULSE_ESCALATION_WIFI_GIVEUP_MIN
+	int "Minutes to keep retrying WiFi escalation before giving up"
+	default 10
+	help
+	  How long the watch keeps trying to reach its anchors over WiFi after
+	  the BLE link has failed, before it stops.
+
+	  Escalation is BLE-first: the watch already holds a connection to the
+	  anchor for ranging, so it writes there. WiFi is the fallback for the
+	  case that matters most — the watch carried out of BLE range and left
+	  there, which is Sunrise Lock's known bypass. Those two are mutually
+	  exclusive by construction, which is required: BLE and WiFi cannot both
+	  run on Board V1 (agent-notes 2026-09-12), and the FCC grant is
+	  expected to forbid simultaneous operation.
+
+	  Giving up is a DELIBERATE limit, not a fix. A watch that can reach
+	  neither its anchor nor any network cannot escalate at all, and no
+	  amount of retrying changes that; it is out of scope by decision.
+
 config IMPULSE_CS_REFLECTOR
 	bool "Channel Sounding REFLECTOR (anchor role)"
 	help
@@ -222,6 +241,25 @@ config IMPULSE_NET
 	  known bypass — leave the watch out of BLE range and go back to bed —
 	  so it deliberately rides WiFi rather than BLE, which by construction
 	  cannot outreach the thing it is trying to detect the absence of.
+
+config IMPULSE_ESCALATION_WIFI_GIVEUP_MIN
+	int "Minutes to keep retrying WiFi escalation before giving up"
+	default 10
+	help
+	  How long the watch keeps trying to reach its anchors over WiFi after
+	  the BLE link has failed, before it stops.
+
+	  Escalation is BLE-first: the watch already holds a connection to the
+	  anchor for ranging, so it writes there. WiFi is the fallback for the
+	  case that matters most — the watch carried out of BLE range and left
+	  there, which is Sunrise Lock's known bypass. Those two are mutually
+	  exclusive by construction, which is required: BLE and WiFi cannot both
+	  run on Board V1 (agent-notes 2026-09-12), and the FCC grant is
+	  expected to forbid simultaneous operation.
+
+	  Giving up is a DELIBERATE limit, not a fix. A watch that can reach
+	  neither its anchor nor any network cannot escalate at all, and no
+	  amount of retrying changes that; it is out of scope by decision.
 
 config IMPULSE_CS_REFLECTOR
 	bool "Channel Sounding REFLECTOR (anchor role)"

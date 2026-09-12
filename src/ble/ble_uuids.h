@@ -25,6 +25,18 @@
 #define IMPULSE_UUID_ANCHOR_DOCK_REG   IMPULSE_UUID_BASE(0x4a0f000c)
 #define IMPULSE_UUID_ANCHOR_DOCK_STAT  IMPULSE_UUID_BASE(0x4a0f000d)
 #define IMPULSE_UUID_ANCHOR_WIFI_STAT  IMPULSE_UUID_BASE(0x4a0f000e)
+/*
+ * Watch -> anchor escalation over BLE (WATCH_REMOVED / WATCH_WORN).
+ *
+ * Carries the SAME 33-byte §6.1 payload as the UDP path, deliberately: the
+ * anchor validates it with identical code, so the two transports cannot drift
+ * apart in what they accept. Only the carrier differs.
+ *
+ * This exists because BLE and WiFi cannot both be active on Board V1 (see
+ * agent-notes 2026-09-12), and because the product must not depend on
+ * simultaneous radios — the FCC grant is expected to forbid it.
+ */
+#define IMPULSE_UUID_ANCHOR_WATCH_STATE IMPULSE_UUID_BASE(0x4a0f000f)
 
 #define IMPULSE_UUID_WATCH_SVC       IMPULSE_UUID_BASE(0x4a0f0010)
 #define IMPULSE_UUID_WIFI_CRED       IMPULSE_UUID_BASE(0x4a0f0011)

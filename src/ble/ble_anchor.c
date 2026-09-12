@@ -15,6 +15,8 @@
 #include "../schedule/schedule_blob.h"
 #include "ble_uuids.h"
 
+#include "../anchor/anchor.h"
+
 #if defined(CONFIG_IMPULSE_NET)
 #include "../net/net_wifi.h"
 #endif
@@ -37,7 +39,7 @@ static uint16_t max_beep_minutes = 30;
 static int16_t anchor_tz_offset_minutes;
 
 static struct k_work identify_work;
-static struct k_work adv_restart_work;
+static struct k_work_delayable adv_restart_work;
 
 static uint8_t toggle_pending;
 static struct k_work toggle_work;
@@ -190,7 +192,9 @@ static ssize_t read_wifi_status(struct bt_conn *conn,
 	/* §4.4 payload:
 	 *   [state][ssid_len][ssid][ipv4 4][rssi+128][slots][crc32 4]
 	 */
-	uint8_t out[2 + IMPULSE_WIFI_SSID_MAX + 4 + 1 + 1 + 4] = {0};
+	/* Sized for the longest SSID the WiFi layer can hold; spelled out here
+	 * so this compiles in builds with no WiFi at all (IMPULSE_NET off). */
+	uint8_t out[2 + 32 + 4 + 1 + 1 + 4] = {0};
 	size_t n = 0;
 
 #if defined(CONFIG_IMPULSE_NET)
@@ -262,6 +266,24 @@ static ssize_t write_anchor_wifi_cred(struct bt_conn *conn,
 }
 #endif
 
+/*
+ * §6.1 escalation arriving over BLE instead of UDP. Same payload, same
+ * validation: this hands straight to the UDP path's packet handler so the two
+ * transports cannot diverge in what they accept.
+ */
+static ssize_t write_watch_state(struct bt_conn *conn,
+				 const struct bt_gatt_attr *attr,
+				 const void *buf, uint16_t len, uint16_t offset,
+				 uint8_t flags)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+	ARG_UNUSED(offset);
+	ARG_UNUSED(flags);
+	impulse_anchor_handle_command(buf, len);
+	return len;
+}
+
 static ssize_t write_stub(struct bt_conn *conn,
 			  const struct bt_gatt_attr *attr, const void *buf,
 			  uint16_t len, uint16_t offset, uint8_t flags)
@@ -322,6 +344,11 @@ BT_GATT_SERVICE_DEFINE(
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ, read_dock_status, NULL, NULL),
 	BT_GATT_CCC(ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(IMPULSE_UUID_ANCHOR_WATCH_STATE),
+			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+			       BT_GATT_PERM_WRITE, NULL, write_watch_state,
+			       NULL),
 
 	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(IMPULSE_UUID_ANCHOR_WIFI_STAT),
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
@@ -525,17 +552,36 @@ static const struct bt_data anchor_sd[] = {
 #endif
 };
 
+/*
+ * RETRY UNTIL IT ACTUALLY STARTS. The previous version tried exactly once and
+ * gave up, which killed the anchor silently and repeatedly:
+ * bt_le_adv_start() commonly answers -ENOMEM straight after a disconnect,
+ * because the connection object has not been released yet. One failed attempt
+ * therefore left the anchor permanently invisible over BLE — no advertising,
+ * no ranging, no way for a watch to find it — while its WiFi and its whole
+ * application carried on normally, so nothing looked wrong from anywhere else.
+ *
+ * Measured 2026-09-12: anchor alive on WiFi (0% packet loss) and running its
+ * main loop, with BLE advertising simply gone. An anchor a watch cannot see
+ * defeats every commitment that names it, so this retries indefinitely rather
+ * than capping attempts.
+ */
 static void adv_restart_work_handler(struct k_work *w)
 {
-	int err;
-
 	ARG_UNUSED(w);
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, anchor_ad,
-			      ARRAY_SIZE(anchor_ad), anchor_sd,
-			      ARRAY_SIZE(anchor_sd));
-	if (err != 0 && err != -EALREADY) {
-		LOG_ERR("anchor advertising restart failed (%d)", err);
+
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, anchor_ad,
+				  ARRAY_SIZE(anchor_ad), anchor_sd,
+				  ARRAY_SIZE(anchor_sd));
+
+	if (err == 0 || err == -EALREADY) {
+		LOG_INF("anchor advertising (iBeacon major 0x%04X)",
+			IMPULSE_MAJOR);
+		return;
 	}
+
+	LOG_WRN("anchor advertising restart failed (%d) — retrying", err);
+	(void)k_work_reschedule(&adv_restart_work, K_MSEC(500));
 }
 
 static void anchor_connected(struct bt_conn *conn, uint8_t err)
@@ -561,7 +607,7 @@ static void anchor_disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 	anchor_xfer.active = false;
 	anchor_xfer.received = 0;
-	(void)k_work_submit(&adv_restart_work);
+	(void)k_work_reschedule(&adv_restart_work, K_NO_WAIT);
 }
 
 BT_CONN_CB_DEFINE(anchor_conn_callbacks) = {
@@ -577,7 +623,7 @@ int impulse_ble_start(void)
 	k_work_init(&toggle_work, toggle_work_handler);
 	k_work_init(&anchor_ack_work, anchor_ack_work_handler);
 	k_work_init(&anchor_end_work, anchor_end_work_handler);
-	k_work_init(&adv_restart_work, adv_restart_work_handler);
+	k_work_init_delayable(&adv_restart_work, adv_restart_work_handler);
 
 	/* Company id 0xFFFF, not Apple's 0x004C: iOS strips Apple
 	 * manufacturer data from scan results (phone_sim constants.py). */

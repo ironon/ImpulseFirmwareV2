@@ -125,14 +125,33 @@ because §9.2 requires integrity timers on a monotonic basis precisely so that w
 wall clock cannot accelerate a quarantine. Verified on hardware: `restored_from_flash=1`
 after a reset, with the enforcement window correctly re-entered.
 
+### ✅ CLOSED — the reflector reflects, and the loop is shut
+
+**This section used to say nothing had ever ranged against the reflector. That is no longer
+true and the correction matters, because it was the open joint in the product loop.** Two
+Board V1s now range against each other: a single line-of-sight point at ~61 cm gives `ifft` a
+median of **1.32–1.36 m at 0.02–0.04 m sd** over 150+ samples (`cs_tuning_plan.md`,
+2026-09-10), and the enforcement session above produced **172 estimates in 60 s** driving a
+real `cond_met`.
+
+**What that changed:** `IMPULSE_CS_IFFT_OFFSET_CM` moved **97 → 72**. The old constant came
+from the DK pair and errs in the **unsafe** direction — it reports the watch ~25 cm closer
+than it is, so a `stayNear` commitment reads as satisfied slightly too far out.
+
+**What is still owed** is in `cs_tuning_plan.md` and has not shrunk: the slope (0.993) is
+still the DK's, and **one point cannot separate slope from offset**. Until the multi-station
+sweep is run, every threshold resting on that fit is provisional.
+
 ### ⚠️ OPEN, and now the most serious thing here
 
-**Nothing has ever ranged against the reflector.** The reflector boots, registers the Ranging
-Service and advertises `0x185B` over the air, and the initiator runs inside the watch image —
-but no CS procedure has ever completed between them, because that needs two boards and only
-one works. Every distance number this product depends on is still measured Board V1 → **DK**,
-and the `+0.97 m` calibration constant is specific to that pair. Until a procedure completes
-board-to-board, the product loop is open at its most important joint.
+**The initiator ranges the wrong anchor.** It holds and measures whatever matches the iBeacon
+manufacturer prefix, not the anchor named by `event.anchorId`. With one anchor in the room
+that is invisible; with two in a house it silently measures the other one, and a `stayNear`
+commitment can be satisfied by standing next to an anchor the commitment never named.
+
+**Two more, both cheaper:** the anchor half of `WATCH_REMOVED` is written and has **never
+been exercised**, and the trigger it hangs off — worn detection — is still unverified because
+the IR window sits behind the enclosure. The transport can be complete and still never fire.
 
 ---
 

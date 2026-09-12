@@ -65,4 +65,18 @@ struct impulse_anchor_beep *impulse_anchor_beep_state(void);
  * UUID belongs to. Blocking; call from a workqueue, never a BLE callback. */
 void impulse_anchor_identify(void);
 
+/* §6.1 command packet: [1 cmd][16 watch uuid][16 event uuid]. */
+#define IMPULSE_CMD_WATCH_REMOVED 0x01
+#define IMPULSE_CMD_WATCH_WORN    0x02
+#define IMPULSE_CMD_PACKET_LEN    33
+
+/*
+ * Handle a watch->anchor command, whatever carried it.
+ *
+ * Lives here rather than in the UDP layer because the BLE transport must work
+ * on an anchor built with NO WiFi at all — and because having one validator
+ * means the two carriers cannot drift apart in what they accept.
+ */
+void impulse_anchor_handle_command(const uint8_t *pkt, size_t len);
+
 #endif /* IMPULSE_ANCHOR_H_ */

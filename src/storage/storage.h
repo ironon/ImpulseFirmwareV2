@@ -57,6 +57,12 @@ int impulse_storage_save_anchor_ips(const struct impulse_anchor_ip *tbl,
 int impulse_storage_load_anchor_ips(struct impulse_anchor_ip *tbl,
 				    uint8_t max, uint8_t *count_out);
 
+/* Persisted boot counter. A board that silently resets is indistinguishable
+ * from one whose radios died — both go quiet — and the RTT buffer is wiped by
+ * the reset, so the log cannot tell you either. This can. */
+int impulse_storage_save_boot_count(uint32_t n);
+int impulse_storage_load_boot_count(uint32_t *n);
+
 int impulse_storage_save_wall_clock(int64_t utc_s);
 int impulse_storage_load_wall_clock(int64_t *utc_s);
 

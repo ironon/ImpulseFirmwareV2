@@ -74,6 +74,10 @@
 #include "cs_fuse.h"
 #include "proximity.h"
 
+#include "../anchor/anchor.h"
+#include "../ble/ble_uuids.h"
+#include "../identity.h"
+
 /* Defined at the bottom, called from the ranging callback above. */
 void impulse_cs_on_estimate(const cs_de_dist_estimates_t *est);
 LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
@@ -988,6 +992,84 @@ void impulse_cs_set_ranging(bool on)
 	apply_ranging_state();
 }
 
+/* ------------------------------------------------------------------ *
+ * Escalation over the CS link (§5.5.1 carried by BLE instead of UDP).
+ *
+ * The watch already holds a central connection to the anchor for ranging, so
+ * the cheapest and most reliable way to say "I have been taken off" is to
+ * write it there. WiFi is the FALLBACK, used only when this link does not
+ * exist — which is exactly the out-of-range case WiFi is for, and which keeps
+ * the two radios mutually exclusive in time (agent-notes 2026-09-12).
+ * ------------------------------------------------------------------ */
+
+static uint16_t g_watch_state_handle;
+static struct bt_gatt_discover_params g_ws_discover;
+static const struct bt_uuid_128 uuid_watch_state =
+	BT_UUID_INIT_128(IMPULSE_UUID_ANCHOR_WATCH_STATE);
+
+static uint8_t ws_discover_cb(struct bt_conn *conn,
+			      const struct bt_gatt_attr *attr,
+			      struct bt_gatt_discover_params *params)
+{
+	ARG_UNUSED(conn);
+
+	if (attr == NULL) {
+		if (g_watch_state_handle == 0U) {
+			LOG_WRN("anchor has no watch-state characteristic; "
+				"escalation will fall back to WiFi");
+		}
+		return BT_GATT_ITER_STOP;
+	}
+
+	/* For a characteristic discovery the VALUE handle is attr->handle + 1. */
+	g_watch_state_handle = bt_gatt_attr_value_handle(attr);
+	LOG_INF("anchor watch-state characteristic at handle %u",
+		g_watch_state_handle);
+	return BT_GATT_ITER_STOP;
+}
+
+static void ws_discover_start(struct bt_conn *conn)
+{
+	g_watch_state_handle = 0U;
+	g_ws_discover.uuid = &uuid_watch_state.uuid;
+	g_ws_discover.func = ws_discover_cb;
+	g_ws_discover.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	g_ws_discover.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+	g_ws_discover.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+	int err = bt_gatt_discover(conn, &g_ws_discover);
+
+	if (err) {
+		LOG_WRN("watch-state discovery failed (%d)", err);
+	}
+}
+
+int impulse_cs_notify_watch_state(uint8_t command, const uint8_t *event_uuid)
+{
+	if (connection == NULL || g_watch_state_handle == 0U) {
+		return -ENOTCONN;
+	}
+
+	uint8_t pkt[IMPULSE_CMD_PACKET_LEN];
+
+	pkt[0] = command;
+	memcpy(&pkt[1], impulse_watch_uuid(), IMPULSE_UUID_LEN);
+	memcpy(&pkt[1 + IMPULSE_UUID_LEN], event_uuid, IMPULSE_UUID_LEN);
+
+	/* Write WITHOUT response: this is re-asserted every poll, so a lost
+	 * write costs one cycle and never blocks the enforcement loop. */
+	int err = bt_gatt_write_without_response(connection,
+						 g_watch_state_handle, pkt,
+						 sizeof(pkt), false);
+
+	if (err) {
+		LOG_WRN("watch-state write failed (%d)", err);
+		return err;
+	}
+	LOG_INF("escalation 0x%02x -> anchor over BLE", command);
+	return 0;
+}
+
 static void cs_engine_entry(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -1109,6 +1191,8 @@ restart:
 	static struct bt_gatt_exchange_params mtu_exchange_params = {.func = mtu_exchange_cb};
 
 	bt_gatt_exchange_mtu(connection, &mtu_exchange_params);
+
+	ws_discover_start(connection);
 
 	k_sem_take(&sem_mtu_exchange_done, K_SECONDS(20));
 	if (connection == NULL) {
@@ -1304,6 +1388,7 @@ restart:
  */
 static K_MUTEX_DEFINE(impulse_burst_mutex);
 static struct impulse_cs_burst impulse_live_burst;
+static K_SEM_DEFINE(sem_burst_ready, 0, 1);
 static struct impulse_cs_measurement impulse_last_result;
 static bool impulse_have_result;
 static int64_t impulse_last_result_ms;
@@ -1312,6 +1397,34 @@ static int64_t impulse_last_result_ms;
  * abstention. One enforcement poll at the compliant tier is 180 s, so a
  * result older than a few seconds says the link has stopped producing. */
 #define IMPULSE_CS_RESULT_MAX_AGE_MS 5000
+
+/*
+ * How long measure() will WAIT for a fresh burst before giving up.
+ *
+ * THIS IS THE BRIDGE OVER A 12-36x GAP, and without it the whole proximity
+ * path is dead on real hardware. The enforcement loop asks for a distance
+ * every 60 s (condition not met) or 180 s (met), but a result goes stale after
+ * 5 s — so measure() essentially ALWAYS found a stale result and abstained,
+ * however well the radio was working. Worse, it was self-reinforcing: abstain
+ * -> getAway fails open -> condition "met" -> poll slows to 180 s -> staler
+ * still. Observed 2026-09-12: a watch 0.67 m from its anchor, 228 good
+ * estimates in hand, reporting no verdict and staying silent through a
+ * Sunrise Lock window.
+ *
+ * Waiting is the right fix rather than widening MAX_AGE: the 5 s freshness
+ * rule exists so a cached "near" cannot outlive the link, which is exactly how
+ * a device reports compliance for someone who has walked away.
+ *
+ * 8 s, raised from 3 s after measuring the real cadence: procedures arrive at
+ * ~3 Hz on this pair rather than the ~10 Hz the tuning plan assumed, so a
+ * burst of IMPULSE_CS_BURST_MIN_ACCEPTED samples takes ~3.3 s and a 3 s wait
+ * missed it more often than not — the watch abstained through two consecutive
+ * polls with ranging running perfectly. 8 s gives two chances at a burst.
+ *
+ * It is also an upper bound on how long the enforcement loop stalls, so it
+ * must stay well under the profile step times that drive the motor.
+ */
+#define IMPULSE_CS_MEASURE_WAIT_MS 8000
 
 void impulse_cs_on_estimate(const cs_de_dist_estimates_t *est)
 {
@@ -1346,7 +1459,17 @@ void impulse_cs_on_estimate(const cs_de_dist_estimates_t *est)
 					&impulse_last_result);
 		impulse_have_result = true;
 		impulse_last_result_ms = k_uptime_get();
+		LOG_INF("cs burst DONE: n=%u rej_range=%u rej_qual=%u relay=%u "
+			"miss_ifft=%u -> result=%d dist=%u cm",
+			impulse_live_burst.count,
+			impulse_live_burst.rejected_range,
+			impulse_live_burst.rejected_quality,
+			impulse_live_burst.suspect_relay,
+			impulse_live_burst.missing_ifft,
+			(int)impulse_last_result.result,
+			impulse_last_result.distance_cm);
 		impulse_cs_burst_init(&impulse_live_burst);
+		k_sem_give(&sem_burst_ready);
 	}
 	k_mutex_unlock(&impulse_burst_mutex);
 }
@@ -1360,10 +1483,37 @@ static void impulse_cs_measure(const uint8_t *anchor_id,
 	 * before this can enforce a real commitment. */
 	ARG_UNUSED(anchor_id);
 
+	/*
+	 * Wait for a FRESH burst rather than serving whatever happens to be
+	 * lying around. The enforcement poll is 60-180 s apart and a result
+	 * goes stale in 5 s, so without this the answer is almost always
+	 * "abstain" no matter how healthy the link is.
+	 *
+	 * Cheap in the common case: if a burst completed within the freshness
+	 * window we take it immediately and never sleep.
+	 */
+	k_mutex_lock(&impulse_burst_mutex, K_FOREVER);
+	bool fresh = impulse_have_result &&
+		     (k_uptime_get() - impulse_last_result_ms) <=
+			     IMPULSE_CS_RESULT_MAX_AGE_MS;
+	k_mutex_unlock(&impulse_burst_mutex);
+
+	if (!fresh) {
+		k_sem_reset(&sem_burst_ready);
+		(void)k_sem_take(&sem_burst_ready,
+				 K_MSEC(IMPULSE_CS_MEASURE_WAIT_MS));
+	}
+
 	k_mutex_lock(&impulse_burst_mutex, K_FOREVER);
 	if (!impulse_have_result ||
 	    (k_uptime_get() - impulse_last_result_ms) >
 		    IMPULSE_CS_RESULT_MAX_AGE_MS) {
+		LOG_INF("cs measure ABSTAIN: have=%d age=%lld ms burst_n=%u",
+			(int)impulse_have_result,
+			impulse_have_result
+				? (k_uptime_get() - impulse_last_result_ms)
+				: -1,
+			impulse_live_burst.count);
 		/* Stale or absent: abstain. Never hand back an old distance —
 		 * a cached "near" outliving the link is exactly how a device
 		 * reports compliance for someone who has walked away. */

@@ -13,7 +13,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JL=~/Tools/jlink/JLink_Linux_V972_x86_64/JLinkExe
 HEX="$HERE/build-$ROLE/nrf_firmware/zephyr/zephyr.hex"
 
-case "$ROLE" in watch|anchor) ;; *) echo "usage: $0 {watch|anchor}"; exit 2 ;; esac
+# A role may carry a build variant suffix ("watch-cs" -> build-watch-cs), so the
+# BLE-only and WiFi builds can sit side by side without a pristine rebuild
+# between flashes. The die check below is what actually keeps the two BOARDS
+# apart; this only selects which image goes down.
+case "$ROLE" in
+  watch|anchor|watch-*|anchor-*) ;;
+  *) echo "usage: $0 {watch|anchor}[-variant]"; exit 2 ;;
+esac
 [ -f "$HEX" ] || { echo "missing $HEX — run ./build.sh $ROLE first"; exit 1; }
 
 CMD="$(mktemp)"; trap 'rm -f "$CMD"' EXIT

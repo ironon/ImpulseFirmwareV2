@@ -3,6 +3,10 @@
 
 #include <string.h>
 
+#include "../app_api.h"
+
+#include <string.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -207,3 +211,61 @@ void impulse_anchor_identify(void)
 	k_msleep(IDENTIFY_BEEP_DURATION_MS);
 	impulse_buzzer_set(false);
 }
+
+void impulse_anchor_handle_command(const uint8_t *pkt, size_t len)
+{
+	if (len != IMPULSE_CMD_PACKET_LEN) {
+		LOG_WRN("cmd: ignoring %u-byte datagram (expected %d)",
+			(unsigned)len, IMPULSE_CMD_PACKET_LEN);
+		return;
+	}
+
+	uint8_t command = pkt[0];
+	const uint8_t *event_uuid = &pkt[1 + IMPULSE_UUID_LEN];
+
+	if (command == IMPULSE_CMD_WATCH_WORN) {
+		/* §4.6: stop all beeping immediately. Unconditional — a watch
+		 * saying "I am back on" must never be second-guessed. */
+		LOG_INF("cmd: WATCH_WORN — stopping alarm");
+		impulse_anchor_beep_stop();
+		return;
+	}
+
+	if (command != IMPULSE_CMD_WATCH_REMOVED) {
+		return;
+	}
+
+	const struct impulse_event *ev = impulse_app_find_active_event(event_uuid);
+
+	if (ev == NULL) {
+		LOG_DBG("cmd: WATCH_REMOVED for an event that is not active here");
+		return;
+	}
+
+	/* Is THIS anchor in the event's beepAnchors? If not, ignore (§4.6.5). */
+	const uint8_t *me = impulse_anchor_uuid();
+	bool mine = false;
+
+	for (uint8_t i = 0; i < ev->beep_anchor_count; i++) {
+		if (memcmp(ev->beep_anchors[i], me, IMPULSE_UUID_LEN) == 0) {
+			mine = true;
+			break;
+		}
+	}
+	if (!mine) {
+		LOG_DBG("cmd: WATCH_REMOVED but this anchor is not in beepAnchors");
+		return;
+	}
+
+	uint8_t profile = ev->anchor_profile;
+
+	if (profile > IMPULSE_ANCHOR_PROFILE_HARD) {
+		/* §4.11.1 precedent: a missing anchorProfile defaults to MEDIUM
+		 * rather than silently not alarming. A commitment whose alarm
+		 * is dead because a field was omitted is the worst outcome. */
+		profile = IMPULSE_ANCHOR_PROFILE_MEDIUM;
+	}
+
+	impulse_anchor_beep_start(profile);
+}
+

@@ -34,11 +34,24 @@ void impulse_enforcement_enter(struct impulse_enforcement_ctx *ctx,
 	 * transition, OR the window start if the watch is already on — donning
 	 * the watch just before a window should not be punished.
 	 */
-	if (e->donning_grace_s > 0U) {
+	if (e->donning_grace_s > 0U && worn_now) {
 		ctx->donned_at_utc = now_utc;
 		ctx->grace_deadline_utc =
 			now_utc + (int64_t)e->donning_grace_s;
 	} else {
+		/*
+		 * NOT worn at the window start => NO grace. The `worn_now`
+		 * test is load-bearing and was missing: the grace opened on
+		 * every window regardless, so a watch sitting on the nightstand
+		 * — which is exactly the Sunrise Lock case, §5.4.4 — entered
+		 * its window already inside a grace it had not earned and
+		 * stayed silent for donning_grace_s. At the spec maximum of
+		 * 1800 s that is the entire alarm.
+		 *
+		 * Donning later still opens a fresh grace via set_worn(),
+		 * which is the path the feature is actually for.
+		 */
+		ctx->donned_at_utc = 0;
 		ctx->grace_deadline_utc = 0;
 	}
 
@@ -86,6 +99,37 @@ static bool ssid_matches(const struct impulse_event *e, const char *ssid)
 	return strncmp(e->wifi_ssid, ssid, IMPULSE_MAX_SSID_LEN) == 0;
 }
 
+/*
+ * Single exit for check_condition. The profile transition (start on not-met,
+ * stop on met) MUST run for every path, including the short-circuits.
+ *
+ * It used to live only at the bottom of check_condition, so the three early
+ * returns above it — no active event, donning grace, and the phoneAway
+ * fail-open — set condition_met = true and returned WITHOUT ever calling
+ * impulse_profile_stop(). profile_run therefore kept motor_on = 1, and since
+ * main() drives the pads from profile_run every pass, putting the watch on
+ * during an alarm reported cond_met=1 while the vibration motor kept running
+ * until the window closed. Observed on hardware 2026-09-12: worn=1,
+ * cond_met=1, P3 OUT = 0x08 for the whole grace period.
+ */
+static bool settle(struct impulse_enforcement_ctx *ctx,
+		   const struct impulse_event *e, bool met)
+{
+	if (met != ctx->condition_met) {
+		if (met) {
+			/* All output stops IMMEDIATELY on the transition to
+			 * met (§5.4.1). */
+			impulse_profile_stop(&ctx->profile_run);
+		} else {
+			/* Not-met restarts the profile from its beginning. */
+			impulse_profile_start(&ctx->profile_run, e->profile);
+		}
+	}
+
+	ctx->condition_met = met;
+	return met;
+}
+
 bool impulse_enforcement_check_condition(struct impulse_enforcement_ctx *ctx,
 					 int64_t now_utc, bool wifi_connected,
 					 const char *wifi_ssid, bool docked)
@@ -94,16 +138,14 @@ bool impulse_enforcement_check_condition(struct impulse_enforcement_ctx *ctx,
 	bool met;
 
 	if (e == NULL) {
-		ctx->condition_met = true;
-		return true;
+		return settle(ctx, e, true);
 	}
 
 	/* Donning grace short-circuits to MET, the same shape as the Mode B
 	 * tolerance below. No output, and the caller may sleep — but it must
 	 * cap that sleep at the deadline so expiry is not slept through. */
 	if (ctx->grace_deadline_utc != 0 && now_utc < ctx->grace_deadline_utc) {
-		ctx->condition_met = true;
-		return true;
+		return settle(ctx, e, true);
 	}
 
 	switch (e->criteria) {
@@ -130,8 +172,7 @@ bool impulse_enforcement_check_condition(struct impulse_enforcement_ctx *ctx,
 		if (impulse_prox_in_failsafe(&ctx->prox) ||
 		    !ctx->prox.have_verdict) {
 			ctx->phone_near_since_utc = 0;
-			ctx->condition_met = true;
-			return true;
+			return settle(ctx, e, true);
 		}
 
 		bool undocked = !docked || ctx->phone_undock_latched;
@@ -160,19 +201,7 @@ bool impulse_enforcement_check_condition(struct impulse_enforcement_ctx *ctx,
 		break;
 	}
 
-	if (met != ctx->condition_met) {
-		if (met) {
-			/* All output stops IMMEDIATELY on the transition to
-			 * met (§5.4.1). */
-			impulse_profile_stop(&ctx->profile_run);
-		} else {
-			/* Not-met restarts the profile from its beginning. */
-			impulse_profile_start(&ctx->profile_run, e->profile);
-		}
-	}
-
-	ctx->condition_met = met;
-	return met;
+	return settle(ctx, e, met);
 }
 
 bool impulse_enforcement_tick(struct impulse_enforcement_ctx *ctx,
@@ -187,6 +216,19 @@ bool impulse_enforcement_tick(struct impulse_enforcement_ctx *ctx,
 uint32_t impulse_enforcement_poll_interval_s(
 	const struct impulse_enforcement_ctx *ctx)
 {
+	/*
+	 * ABSTENTION MUST NOT BUY THE SLOW CADENCE.
+	 *
+	 * The criterion-dependent fail-safe makes getAway report "met" when
+	 * there is no measurement — which is right for enforcement, but wrong
+	 * for scheduling: it meant the watch polled every 180 s precisely when
+	 * it knew nothing, so it stayed ignorant longer and kept failing open.
+	 * A watch with no verdict is not a watch in a settled state; poll it at
+	 * the attentive cadence until it actually knows something.
+	 */
+	if (!ctx->prox.have_verdict) {
+		return IMPULSE_ENFORCEMENT_POLL_NOT_MET_S;
+	}
 	return ctx->condition_met ? IMPULSE_ENFORCEMENT_POLL_MET_S
 				  : IMPULSE_ENFORCEMENT_POLL_NOT_MET_S;
 }
