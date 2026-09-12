@@ -17,6 +17,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/reboot.h>
 
 #include "enforcement/enforcement.h"
 #include "hal/hal.h"
@@ -914,6 +915,43 @@ void impulse_app_report(void)
 
 #endif /* CONFIG_IMPULSE_BRINGUP_SHELL */
 
+
+#if defined(CONFIG_IMPULSE_SYSWORKQ_WATCHDOG)
+/*
+ * SYSTEM WORKQUEUE LIVENESS.
+ *
+ * The system workqueue can deadlock permanently and take no thread down with
+ * it. On a BLE disconnect the host runs its connection teardown there; for a
+ * Channel Sounding link that reaches bt_ras_rrsp_free(), which calls
+ * k_work_queue_drain(&rrsp_wq) and waits K_FOREVER. The k_work_cancel() just
+ * above it does not stop an already-RUNNING handler, so a RAS reflector caught
+ * mid-send keeps running and blocks forever on an ATT buffer that a dead
+ * connection will never return.
+ *
+ * What makes this worth a watchdog rather than a fix is how it presents.
+ * Every other thread is fine — main loop, logging, heartbeat, the radios — so
+ * the device reports itself healthy in every way it knows how to report, while
+ * being unreachable over BLE and unable to run a single deferred work item.
+ * It read as "the anchor keeps dying while powered" for two days.
+ *
+ * The probe is a bare work item. If the system queue is running at all it will
+ * be handled within milliseconds; if it is wedged, last_run stops advancing and
+ * nothing else here has to understand why. The connection object is leaked
+ * (its ref never drops), so no in-process recovery exists — a cold reboot is
+ * the only way out, and it is cheap: the schedule is in NVS and the clock is
+ * persisted.
+ */
+static int64_t g_sysworkq_last_run;
+
+static void sysworkq_probe_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	g_sysworkq_last_run = k_uptime_get();
+}
+
+static K_WORK_DEFINE(g_sysworkq_probe, sysworkq_probe_handler);
+#endif /* CONFIG_IMPULSE_SYSWORKQ_WATCHDOG */
+
 int main(void)
 {
 	int err;
@@ -1118,11 +1156,40 @@ int main(void)
 	int64_t last_clock_save = 0;
 	int64_t last_sense = 0;
 
+#if defined(CONFIG_IMPULSE_SYSWORKQ_WATCHDOG)
+	int64_t last_sysworkq_probe = 0;
+
+	g_sysworkq_last_run = k_uptime_get();
+#endif
+
 	while (1) {
 		int64_t now_ms = k_uptime_get();
 		uint32_t dt = (uint32_t)(now_ms - last_tick);
 
 		last_tick = now_ms;
+
+#if defined(CONFIG_IMPULSE_SYSWORKQ_WATCHDOG)
+		{
+			const int64_t stall_ms =
+				(int64_t)CONFIG_IMPULSE_SYSWORKQ_STALL_S * 1000;
+
+			/* Probe four times per stall window, so a single
+			 * unlucky sample cannot trip the reboot. */
+			if ((now_ms - last_sysworkq_probe) >= stall_ms / 4) {
+				last_sysworkq_probe = now_ms;
+				(void)k_work_submit(&g_sysworkq_probe);
+			}
+
+			if ((now_ms - g_sysworkq_last_run) > stall_ms) {
+				LOG_ERR("system workqueue stalled for %lld ms "
+					"— rebooting",
+					now_ms - g_sysworkq_last_run);
+				/* Give the logger a chance to drain. */
+				k_sleep(K_MSEC(200));
+				sys_reboot(SYS_REBOOT_COLD);
+			}
+		}
+#endif
 
 #if defined(CONFIG_IMPULSE_ROLE_ANCHOR)
 		/*

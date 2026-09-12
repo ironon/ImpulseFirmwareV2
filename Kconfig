@@ -216,190 +216,41 @@ config IMPULSE_MAX_EVENTS
 	  rejected rather than truncated — a silently shortened schedule is a
 	  silently weakened commitment.
 
-config IMPULSE_BLE
-	bool "App-facing BLE peripheral and GATT surface"
-	default y
-	select BT
-	select BT_PERIPHERAL
-	select BT_GATT_DYNAMIC_DB
-	help
-	  The watch GATT service of firmware_spec_v2.md §5.6, minus the
-	  deletions in v3 §4.8. This is how the app pushes a schedule, so with
-	  it off the device cannot be configured at all.
-
-	  The contract is FROZEN and declared in four places (CLAUDE.md).
-	  Changing a UUID or a payload here without moving the app and
-	  phone_sim in the same change breaks the product.
-
-config IMPULSE_NET
-	bool "WiFi + UDP anchor escalation (WATCH_REMOVED)"
-	depends on WIFI_NRF70
-	default y if WIFI_NRF70
-	help
-	  The §5.5.1 anchor-escalation path: the watch tells anchors it has been
-	  taken off, over UDP. This is the transport that closes Sunrise Lock's
-	  known bypass — leave the watch out of BLE range and go back to bed —
-	  so it deliberately rides WiFi rather than BLE, which by construction
-	  cannot outreach the thing it is trying to detect the absence of.
-
-config IMPULSE_ESCALATION_WIFI_GIVEUP_MIN
-	int "Minutes to keep retrying WiFi escalation before giving up"
-	default 10
-	help
-	  How long the watch keeps trying to reach its anchors over WiFi after
-	  the BLE link has failed, before it stops.
-
-	  Escalation is BLE-first: the watch already holds a connection to the
-	  anchor for ranging, so it writes there. WiFi is the fallback for the
-	  case that matters most — the watch carried out of BLE range and left
-	  there, which is Sunrise Lock's known bypass. Those two are mutually
-	  exclusive by construction, which is required: BLE and WiFi cannot both
-	  run on Board V1 (agent-notes 2026-09-12), and the FCC grant is
-	  expected to forbid simultaneous operation.
-
-	  Giving up is a DELIBERATE limit, not a fix. A watch that can reach
-	  neither its anchor nor any network cannot escalate at all, and no
-	  amount of retrying changes that; it is out of scope by decision.
-
-config IMPULSE_CS_REFLECTOR
-	bool "Channel Sounding REFLECTOR (anchor role)"
-	help
-	  The anchor half of the ranging pair: answers an initiator's tones and
-	  serves ranging data over RAS. Computes no distance — the watch does
-	  that, because the watch is the root of trust and an anchor is not
-	  trusted to report its own distance (v3 §4).
-
-	  Mutually exclusive with IMPULSE_CS_BACKEND, which is the initiator.
-	  Build with: ./build.sh anchor -- -DEXTRA_CONF_FILE="anchor.conf;cs_reflector.conf"
-
-config IMPULSE_CS_BACKEND
-	bool "Real Channel Sounding backend (BLE + RAS)"
-	default n
-	select BT
-	select BT_CENTRAL
-	select BT_SMP
-	select BT_GATT_CLIENT
-	select BT_GATT_DYNAMIC_DB
-	select BT_CHANNEL_SOUNDING
-	select BT_RAS
-	select BT_RAS_RREQ
-	select BT_SCAN
-	select BT_SCAN_FILTER_ENABLE
-	select BT_CS_DE
-	select BT_TRANSMIT_POWER_CONTROL
-	select FPU
-	select FPU_SHARING
-	select CBPRINTF_FP_SUPPORT
-	help
-	  Replaces the abstaining stub with the real radio. Verified working
-	  between Board V1 and an nRF54L15-DK in ../nrf_cs_test.
-
-	  Default n while it still owns its own central connection and ranges
-	  against whatever advertises the RAS service rather than against
-	  event.anchorId — see the gap list at the top of cs_backend_nrf.c.
-	  With it off, every measurement abstains, which fails CLOSED for
-	  stayNear and open for getAway, exactly as spec §4.5 requires.
-
-config IMPULSE_BRINGUP_SHELL
-	bool "Bring-up shell over RTT"
-	depends on SHELL
+config IMPULSE_SYSWORKQ_WATCHDOG
+	bool "Reboot if the system workqueue stops making progress"
 	default y
 	help
-	  Interactive commands that drive the buzzer, motor and LED ring
-	  directly. Board V1 has no UART, so this is the only way to poke a
-	  driver by hand.
+	  Supervises the SYSTEM workqueue from the main thread and cold-reboots
+	  the device if it stops running work.
 
-	  MUST BE OFF IN A RELEASE IMAGE. On a commitment device, a runtime
-	  path that can silence the motor and buzzer is a bypass; this is the
-	  same reasoning that makes write-capable debug tools compile-time
-	  excluded in the app rather than runtime-gated.
+	  This exists because of a real deadlock, diagnosed on the anchor over
+	  SWD on 2026-09-12 (agent-notes). On a BLE disconnect the host runs its
+	  connection teardown on the system workqueue; for a Channel Sounding
+	  link that reaches bt_ras_rrsp_free(), which calls
+	  k_work_queue_drain(&rrsp_wq) and waits K_FOREVER. k_work_cancel()
+	  just above it does NOT stop an already-RUNNING handler, so if the RAS
+	  reflector was mid-send it keeps running and blocks forever waiting for
+	  an ATT buffer that a dead connection will never return. The system
+	  workqueue is then wedged for good.
 
-config IMPULSE_BUZZER_DISABLED
-	bool "Compile out ALL buzzer output"
-	default y
+	  Nothing about that is visible from the outside: the main loop, the
+	  logger and the heartbeat all keep running on their own threads, so the
+	  device looks perfectly healthy while being unreachable over BLE and
+	  unable to run any deferred work at all. It cost two days of "the
+	  anchor keeps dying while powered" before the thread states were read.
+
+	  A cold reboot is the honest response — the connection object is leaked
+	  (ref never drops) and no in-process recovery can reclaim it. The
+	  schedule is in NVS and the clock is persisted, so a reboot is cheap.
+
+config IMPULSE_SYSWORKQ_STALL_S
+	int "Seconds without system-workqueue progress before rebooting"
+	depends on IMPULSE_SYSWORKQ_WATCHDOG
+	default 60
 	help
-	  Makes it impossible for this build to make a sound. Intended for
-	  hardware testing in public, where an enforcement alarm or an anchor
-	  removal beep going off would be a genuine disruption.
-
-	  This is COMPILE-TIME on purpose, and it is belt and braces:
-	    - impulse_buzzer_set() compiles to nothing, so no code path — not
-	      an enforcement profile, not the anchor beep pattern, not the
-	      Identify characteristic, not the bring-up shell — can drive it;
-	    - the buzzer pin is never configured as an output. It is left as a
-	      high-impedance input, so even a stray register write cannot make
-	      the pad drive. R17 (10k to GND) holds the net low regardless.
-
-	  A runtime flag would not do: on a commitment device the whole point
-	  of the buzzer is that the user cannot silence it in the moment, so
-	  the only safe way to guarantee silence is to not build the code.
-
-	  DEFAULT IS y — REMEMBER TO SET IT BACK. The firmware prints a loud
-	  warning at every boot while this is on, precisely so a silent buzzer
-	  is never mistaken for a hardware fault later.
-
-config IMPULSE_ADC_CH_BATTERY
-	int "SAADC channel carrying the battery divider"
-	default 0
-	help
-	  IDENTIFIED ON HARDWARE 2026-08-30, not read from a datasheet: the
-	  AIN-to-pin mapping for the nRF54LM20A is in none of our documents
-	  (BM20C.pdf lists analog functions only for the BM15). A boot sweep of
-	  all eight inputs found AIN0 sitting at 2069 mV — Vbat/2 for a 4.14 V
-	  cell — while every other channel was at rail, at zero, or noise.
-
-	  This part has EIGHT inputs, AIN0..AIN7. Higher ids are rejected by
-	  the driver.
-
-config IMPULSE_ADC_CH_IR
-	int "SAADC channel carrying the IR worn-detect receiver"
-	default 1
-	help
-	  Also identified by the boot sweep: AIN1 was the only channel that
-	  moved when the IR emitter was toggled (137 mV -> 73 mV). The swing is
-	  NEGATIVE because the ITR8307's phototransistor pulls the node down as
-	  it receives light, so more reflection means a lower reading.
-
-config IMPULSE_WORN_THRESHOLD_MV
-	int "IR lit-vs-ambient difference to become WORN"
-	default 200
-	help
-	  Worn detection is lit-minus-ambient (§5.2), never an absolute level —
-	  an absolute threshold tracks room lighting rather than skin.
-
-	  STILL AN ESTIMATE. It could not be measured from a wrist because the
-	  IR window is covered by the enclosure (2026-09-10), so this is set
-	  from the NO-WRIST side only, which is the half that can be measured:
-
-	    bare board, nothing in front of the sensor .... 64 mV
-	    board in the case, on a desk, 8 samples ....... 75-90 mV
-
-	  The case RAISES the floor — the plastic reflects the emitter straight
-	  back — so the crosstalk this must clear is ~90 mV, not 64. 200 mV is
-	  a bit over 2x that.
-
-	  BIASED HIGH ON PURPOSE. The two failure directions are not equal:
-	  reading "not worn" while worn costs a donning grace and a spurious
-	  WATCH_REMOVED, while reading "worn" on a nightstand tells the system
-	  a commitment is being honoured by a watch nobody is wearing. The
-	  second is the one worth engineering against.
-
-	  IF WORN NEVER ASSERTS, this is why — the number is too high for what
-	  the enclosure lets through, not a broken sensor. Measure a real wrist
-	  through the final window and set both this and the release value
-	  below. See HARDWARE_TEST_PLAN.
-
-config IMPULSE_WORN_RELEASE_MV
-	int "IR difference at which WORN is released"
-	default 140
-	help
-	  Hysteresis. Below this the watch is considered off the wrist; between
-	  this and IMPULSE_WORN_THRESHOLD_MV the previous state is held.
-
-	  There was previously ONE threshold, so a delta resting near it would
-	  chatter worn/not-worn every second — and each flip drives the donning
-	  grace (§5.4.4) and WATCH_REMOVED, which are not free. Must stay above
-	  the measured no-wrist ceiling (~90 mV) and below the worn threshold.
+	  Must be comfortably longer than any legitimate work item. The probe is
+	  submitted every quarter of this interval, so the true detection window
+	  is between 0.75x and 1x this value.
 
 config IMPULSE_MAX_EVENTS_PER_DAY
 	int "Maximum events resolved for a single day"

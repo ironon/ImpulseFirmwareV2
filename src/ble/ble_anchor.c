@@ -41,6 +41,31 @@ static int16_t anchor_tz_offset_minutes;
 static struct k_work identify_work;
 static struct k_work_delayable adv_restart_work;
 
+/*
+ * The advertising restart runs on its OWN workqueue, not the system one.
+ *
+ * The system workqueue can deadlock permanently, and does. On a BLE
+ * disconnect the host runs its teardown there; for a Channel Sounding link
+ * that reaches bt_ras_rrsp_free(), which calls k_work_queue_drain(&rrsp_wq)
+ * and waits K_FOREVER. The k_work_cancel() immediately above it does NOT stop
+ * an already-RUNNING handler, so a RAS reflector caught mid-send keeps running
+ * and blocks forever waiting for an ATT buffer the dead connection will never
+ * return. Anything queued on the system workqueue after that never runs again.
+ *
+ * Observed on the anchor 2026-09-12, read out over SWD: sysworkq pending on
+ * rrsp_wq's drain queue, rrsp_wq pending on att_pool, conn0 DISCONNECTED with
+ * ref=3, and adv_restart_work sitting QUEUED and untouched. The anchor was
+ * alive — main loop, logging and heartbeat all fine on their own threads — and
+ * had been invisible to every scan for an hour.
+ *
+ * A private queue means the restart still happens in that state, so the anchor
+ * stays findable. It does NOT repair the leak; CONFIG_IMPULSE_SYSWORKQ_WATCHDOG
+ * is what eventually reboots out of it.
+ */
+#define ADV_WQ_STACK_SIZE 1024
+static K_THREAD_STACK_DEFINE(adv_wq_stack, ADV_WQ_STACK_SIZE);
+static struct k_work_q adv_wq;
+
 static uint8_t toggle_pending;
 static struct k_work toggle_work;
 
@@ -581,7 +606,8 @@ static void adv_restart_work_handler(struct k_work *w)
 	}
 
 	LOG_WRN("anchor advertising restart failed (%d) — retrying", err);
-	(void)k_work_reschedule(&adv_restart_work, K_MSEC(500));
+	(void)k_work_reschedule_for_queue(&adv_wq, &adv_restart_work,
+					  K_MSEC(500));
 }
 
 static void anchor_connected(struct bt_conn *conn, uint8_t err)
@@ -607,7 +633,8 @@ static void anchor_disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 	anchor_xfer.active = false;
 	anchor_xfer.received = 0;
-	(void)k_work_reschedule(&adv_restart_work, K_NO_WAIT);
+	(void)k_work_reschedule_for_queue(&adv_wq, &adv_restart_work,
+					  K_NO_WAIT);
 }
 
 BT_CONN_CB_DEFINE(anchor_conn_callbacks) = {
@@ -624,6 +651,15 @@ int impulse_ble_start(void)
 	k_work_init(&anchor_ack_work, anchor_ack_work_handler);
 	k_work_init(&anchor_end_work, anchor_end_work_handler);
 	k_work_init_delayable(&adv_restart_work, adv_restart_work_handler);
+
+	static const struct k_work_queue_config adv_wq_cfg = {
+		.name = "impulse adv",
+	};
+
+	k_work_queue_init(&adv_wq);
+	k_work_queue_start(&adv_wq, adv_wq_stack,
+			   K_THREAD_STACK_SIZEOF(adv_wq_stack),
+			   K_PRIO_PREEMPT(10), &adv_wq_cfg);
 
 	/* Company id 0xFFFF, not Apple's 0x004C: iOS strips Apple
 	 * manufacturer data from scan results (phone_sim constants.py). */
