@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y
+
+# (0x0 - 0x400) is unmapped on this target, so MPU-based null-pointer
+# detection cannot be applied.
+CONFIG_NULL_POINTER_EXCEPTION_DETECTION_NONE=y
+
+CONFIG_CACHE_MANAGEMENT=y
+CONFIG_EXTERNAL_CACHE=y
+
+# Start SYSCOUNTER on driver init — the GRTC is the time base.
+CONFIG_NRF_GRTC_START_SYSCOUNTER=y
+
+CONFIG_GPIO=y
+CONFIG_CONSOLE=y

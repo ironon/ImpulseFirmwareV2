@@ -1,0 +1,13 @@
+# West/CMake build trees. These are 50-125 MB EACH and there is one per
+# role/feature combination (build-watch-cswifi, build-anchor-cswifi, ...), so
+# the glob matters — an exact list goes stale the moment a new combination is
+# built, which is how a 125 MB directory nearly got committed.
+build*/
+
+# Host test binary.
+tests/impulse_tests
+
+# Never commit credentials. WiFi SSID/passphrase are pushed at runtime over
+# GATT or typed into the RTT shell, never stored in the tree (see wifi.conf).
+*.creds
+devices.json

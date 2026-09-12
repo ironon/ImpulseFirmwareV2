@@ -1,0 +1,20 @@
+# NCS version pin.
+#
+# firmware_spec_v3_nrf.md §1.2: pin the SDK, for exactly the reason v2 pinned
+# the ESP32 toolchain. A floating SDK version is a silent-flash-bloat bug
+# waiting to happen — and on this part it is worse, because nRF54LM20A support
+# and the channel-sounding APIs are both new enough to move between releases.
+#
+# v3.4.0 was the latest release on 2026-08-30 and is the version this tree has
+# been compiled against. It has nrf54lm20 board support and TF-M board files.
+manifest:
+  remotes:
+    - name: nrfconnect
+      url-base: https://github.com/nrfconnect
+  projects:
+    - name: sdk-nrf
+      remote: nrfconnect
+      revision: v3.4.0
+      import: true
+  self:
+    path: impulse

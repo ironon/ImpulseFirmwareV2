@@ -1,0 +1,6 @@
+board:
+  name: impulse_v1
+  full_name: Impulse Board V1 (Fanstel BM20C)
+  vendor: impulse
+  socs:
+    - name: nrf54lm20a

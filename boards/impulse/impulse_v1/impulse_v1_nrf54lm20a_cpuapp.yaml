@@ -1,0 +1,19 @@
+identifier: impulse_v1/nrf54lm20a/cpuapp
+name: Impulse Board V1 (BM20C, nRF54LM20A) Application MCU
+type: mcu
+arch: arm
+toolchain:
+  - gnuarmemb
+  - zephyr
+sysbuild: true
+ram: 511
+flash: 2036
+supported:
+  - gpio
+  - spi
+  - adc
+  - counter
+  - led_strip
+testing:
+  ignore_tags:
+    - net

@@ -1,0 +1,62 @@
+/*
+ * Impulse Board V1 pin control.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Pins from firmware_spec_v3_nrf.md §2. Nordic port numbering — a pin number
+ * carried across from the ESP32 spec will be wrong.
+ */
+
+&pinctrl {
+	/*
+	 * LED ring on SPIM30. Only MOSI reaches anything: P0.02 -> R15 -> DIN.
+	 * SCK still has to be assigned somewhere, and P0.06 is a module pad with
+	 * NO NET AT ALL (§2 "module pads with no net"), so driving it is inert.
+	 * It must stay in the P0 (30) domain along with the instance.
+	 */
+	spi30_default: spi30_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 6)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 2)>;
+		};
+	};
+
+	spi30_sleep: spi30_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 6)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 2)>;
+			low-power-enable;
+		};
+	};
+
+	/* IMU bus — shared with the WM02C QSPI (§2). */
+	spi21_default: spi21_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 1, 11)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 6)>,
+				<NRF_PSEL(SPIM_MISO, 1, 7)>;
+		};
+	};
+
+	spi21_sleep: spi21_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 1, 11)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 6)>,
+				<NRF_PSEL(SPIM_MISO, 1, 7)>;
+			low-power-enable;
+		};
+	};
+
+	/* Servo, anchor role only. P1.02 is reachable by PWM20 (P1/P3 domain). */
+	pwm20_default: pwm20_default {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 2)>;
+		};
+	};
+
+	pwm20_sleep: pwm20_sleep {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 2)>;
+			low-power-enable;
+		};
+	};
+};

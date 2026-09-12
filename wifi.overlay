@@ -1,0 +1,73 @@
+/*
+ * WM02C (nRF7002) on Board V1 — SPI, not QSPI.
+ *
+ * Every pin below was read out of the KiCad netlist (U8 = WM02E symbol, the
+ * fitted part is a WM02C), not transcribed from a table:
+ *
+ *   QSPI-DATA0 K8  MOSI      P1.06   shared with the IMU
+ *   QSPI-DATA1 G4  MISO      P1.07   shared with the IMU
+ *   QSPI-CLK   H4  SPI_CLK   P1.11   shared with the IMU
+ *   QSPI-SS    J4  /SPI-SS   P1.10   WiFi chip select
+ *   IRQ        F2  /WIFI_INT P1.15
+ *   BUCK-EN    K6  /BUCK_EN  P2.08
+ *   VDDIO      16            P3.00   via U2, a TPS22916 load switch
+ *
+ * IT IS SPI, NOT QSPI, AND THIS IS A HARDWARE FACT, NOT A CHOICE:
+ * QSPI-DATA2 (pin 2) and QSPI-DATA3 (pin 1) are "unconnected-(U8-QSPI-DATA...)"
+ * in the netlist. Only two data lines are routed, so the part can only be
+ * driven in SPI mode. Anything written against "nordic,nrf7002-qspi" will not
+ * work on this board.
+ *
+ * THE BUS IS SHARED WITH THE IMU (U6, LIS3DHTR) — same SCK/MOSI/MISO, separate
+ * chip selects. That is the arbitration hazard the board DTS has flagged as a
+ * chunk-I problem since the port started. Zephyr's SPI driver serialises
+ * transfers per-bus, so concurrent access is safe by construction; what is NOT
+ * proven is whether the nRF70's timing tolerates being interleaved with IMU
+ * reads.
+ */
+#include <freq.h>
+
+/ {
+	chosen {
+		zephyr,wifi = &wlan0;
+	};
+};
+
+&spi21 {
+	/* Index 0 stays the IMU so its reg = <0> is unchanged; WiFi is added
+	 * as index 1. Order matters — cs-gpios is indexed by the child's reg. */
+	cs-gpios = <&gpio0 0 GPIO_ACTIVE_LOW>,
+		   <&gpio1 10 GPIO_ACTIVE_LOW>;
+
+	nrf70: nrf7002-spi@1 {
+		compatible = "nordic,nrf7002-spi";
+		status = "okay";
+		reg = <1>;
+		spi-max-frequency = <DT_FREQ_M(8)>;
+
+		iovdd-ctrl-gpios = <&gpio3 0 GPIO_ACTIVE_HIGH>;
+		bucken-gpios     = <&gpio2 8 GPIO_ACTIVE_HIGH>;
+		host-irq-gpios   = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+
+		/*
+		 * TX power ceilings copied from Nordic's nRF7002 EB-II shield.
+		 * THESE ARE THE EVALUATION BOARD'S NUMBERS, NOT OURS. v3 §1.1
+		 * makes the certified gain/backoff values a condition of the
+		 * FCC grant, so these must be replaced with the figures from
+		 * our own antenna before anything ships.
+		 */
+		wifi-max-tx-pwr-2g-dsss = <21>;
+		wifi-max-tx-pwr-2g-mcs0 = <16>;
+		wifi-max-tx-pwr-2g-mcs7 = <16>;
+		wifi-max-tx-pwr-5g-low-mcs0 = <13>;
+		wifi-max-tx-pwr-5g-low-mcs7 = <13>;
+		wifi-max-tx-pwr-5g-mid-mcs0 = <13>;
+		wifi-max-tx-pwr-5g-mid-mcs7 = <13>;
+		wifi-max-tx-pwr-5g-high-mcs0 = <12>;
+		wifi-max-tx-pwr-5g-high-mcs7 = <12>;
+
+		wlan0: wlan0 {
+			compatible = "nordic,wlan";
+		};
+	};
+};

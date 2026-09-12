@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_IMPULSE_V1
+	# Board V1 carries an nRF54LM20A. Nordic's own EV boards use the B
+	# variant, which has an Axon NPU the A does not — see spec v3 §1.2.
+	# Nothing here uses the NPU; this select keeps the A build honest.
+	select SOC_NRF54LM20A_DEVELOP_IN_NRF54LM20B if SOC_NRF54LM20A_CPUAPP

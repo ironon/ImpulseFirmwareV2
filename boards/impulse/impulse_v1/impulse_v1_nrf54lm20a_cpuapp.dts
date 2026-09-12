@@ -1,0 +1,280 @@
+/*
+ * Impulse Board V1 — Fanstel BM20C (nRF54LM20A).
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Pin map: firmware_spec_v3_nrf.md §2, which is itself transcribed from
+ * ~/Documents/KiCad/ImpulseBluetooth/Impulse.kicad_sch. Four signals here were
+ * additionally EXERCISED on real hardware on 2026-08-29 (ring, motor, buzzer,
+ * wake button) — those are marked [verified]. Everything else is [from schematic]
+ * and has never been driven. Re-export the netlist before trusting the rest:
+ *   kicad-cli sch export netlist --format kicadsexpr
+ */
+
+/dts-v1/;
+
+#include <nordic/nrf54lm20a_cpuapp.dtsi>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/dt-bindings/led/led.h>
+#include <zephyr/dt-bindings/regulator/nrf5x.h>
+#include <zephyr/dt-bindings/gpio/nordic-nrf-gpio.h>
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+#include "impulse_v1-pinctrl.dtsi"
+
+/ {
+	compatible = "impulse,impulse-v1-nrf54lm20a-cpuapp";
+	model = "Impulse Board V1 (BM20C) Application MCU";
+
+	chosen {
+		zephyr,flash-controller = &rram_controller;
+		zephyr,flash = &cpuapp_rram;
+		zephyr,code-partition = &slot0_partition;
+		zephyr,sram = &cpuapp_sram;
+	};
+
+	aliases {
+		led-strip = &led_ring;
+		watchdog0 = &wdt31;
+	};
+
+	/*
+	 * Simple GPIO outputs. "gpio-leds" is used as a generic output binding
+	 * so each gets a GPIO_DT_SPEC without a custom binding; none of these
+	 * are LEDs and none are driven by the LED subsystem.
+	 */
+	outputs {
+		compatible = "gpio-leds";
+
+		/* [verified 2026-08-29] Active buzzer, direct to BUZZER1, pad C9.
+		 * R17 (10k) pulls it to GND so it is silent through reset.
+		 * DC drive sounds it — confirmed on the bench with a 150 ms pulse,
+		 * so the fitted part is genuinely an active buzzer and no PWM tone
+		 * generation is required. */
+		buzzer: buzzer {
+			/* HIGH DRIVE is required, not cosmetic. The buzzer is a
+			 * ~30 mA load hung directly off the pin with no
+			 * transistor. At standard drive the pad sags far enough
+			 * that its own input buffer reads it back LOW while it
+			 * is being driven high — observed on hardware
+			 * 2026-08-30, and the bare-metal bring-up used
+			 * extra-high drive for the same reason. */
+			gpios = <&gpio3 7 (GPIO_ACTIVE_HIGH | NRF_GPIO_DRIVE_H0H1)>;
+			label = "Buzzer";
+		};
+
+		/* [verified 2026-08-29] Vibration motor, pad A7, via R5 (1k) to Q3
+		 * (BSS138) low-side switch. R10 (100k) holds the gate down through
+		 * reset. Drives a MOSFET gate only, so it sources no real current. */
+		motor: motor {
+			gpios = <&gpio3 3 GPIO_ACTIVE_HIGH>;
+			label = "Vibration motor";
+		};
+
+		/* [from schematic] IR worn-detect emitter, pad E4, via R7 (100R)
+		 * to KEY1 (ITR8307). Lit only during a worn sample — see §5.2. */
+		ir_emit: ir_emit {
+			gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+			label = "IR worn emitter";
+		};
+
+		/* [from schematic] WiFi rails. VDDIO gates U2 (TPS22916) into the
+		 * WM02C, so WiFi can be powered off rather than idled (§1.1). */
+		wifi_vddio_en: wifi_vddio_en {
+			gpios = <&gpio3 0 GPIO_ACTIVE_HIGH>;
+			label = "WiFi VDDIO enable";
+		};
+
+		wifi_buck_en: wifi_buck_en {
+			gpios = <&gpio2 8 GPIO_ACTIVE_HIGH>;
+			label = "WiFi buck enable";
+		};
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+
+		/* [verified 2026-08-29] Wake button S2 to GND, pad D9, on the back
+		 * of the board. No external pull — the internal one is required.
+		 * Short press lights the clock (§6.2); long press is reserved for
+		 * the hard override and is deliberately NOT implemented (chunk J). */
+		wake_button: wake_button {
+			gpios = <&gpio0 5 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Wake button";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+
+		/* [from schematic] Charger detect from the TP4057, pad C5. New on
+		 * Board V1 — v2 had no charge-state input and inferred it from
+		 * voltage (§6.3). Polarity is UNVERIFIED — see the test plan. */
+		charger_detect: charger_detect {
+			gpios = <&gpio1 3 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Charger detect";
+			zephyr,code = <INPUT_KEY_1>;
+		};
+	};
+};
+
+&cpuapp_sram {
+	status = "okay";
+};
+
+/*
+ * Use the on-module 32.768 kHz crystal, not the internal RC.
+ * firmware_spec_v3_nrf.md §3.2 is emphatic about this: Zephyr falls back to
+ * the RC when nothing is specified, which runs silently on a worse clock with
+ * the crystal sitting unused and no error anywhere. Both crystals are embedded
+ * in the BM20C (datasheet Draft Ver 0.82: "32.0 MHz and 32.768 kHz crystals
+ * embedded"), so there is nothing external to fit.
+ * TODO(hw): confirm at runtime in chunk D that LFCLK really is on LFXO.
+ */
+&lfxo {
+	load-capacitors = "internal";
+	load-capacitance-femtofarad = <17000>;
+};
+
+&hfxo {
+	load-capacitors = "internal";
+	load-capacitance-femtofarad = <15000>;
+};
+
+&regulators {
+	status = "okay";
+};
+
+&vregmain {
+	status = "okay";
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+};
+
+&gpio0 { status = "okay"; };
+&gpio1 { status = "okay"; };
+&gpio2 { status = "okay"; };
+&gpio3 { status = "okay"; };
+/*
+ * The nRF clock-control node is status="disabled" in the SoC dtsi and MUST be
+ * enabled here. Without it CONFIG_CLOCK_CONTROL_NRF is never selected, and
+ * MPSL — the radio scheduler under the Bluetooth controller — fails to build
+ * with "Clock source is not supported or not defined". Nothing else in the
+ * firmware needs it, so the omission stays invisible until the first build
+ * that turns on Bluetooth.
+ */
+&clock { status = "okay"; };
+
+&gpiote20 { status = "okay"; };
+&gpiote30 { status = "okay"; };
+/* The GRTC is the system time base and the wake source for scheduled windows.
+ * Channel split copied from Nordic's own DK definition: 7-11 are reserved for
+ * zero-latency IRQs and 3-4 for the FLPR core. */
+&grtc {
+	owned-channels = <0 1 2 3 4 5 6 7 8 9 10 11>;
+	child-owned-channels = <3 4 7 8 9 10 11>;
+	status = "okay";
+};
+/*
+ * EVERY SAADC input is declared, not just the two the board uses, because the
+ * AIN-to-pin mapping for the nRF54LM20A is in no document available here —
+ * datasheets/BM20C.pdf lists analog functions only in its BM15 columns. The
+ * mapping is therefore found empirically: `impulse adc` sweeps all of them and
+ * the battery divider (Vbat/2 on P1.00, a known live voltage) identifies
+ * itself, while toggling the IR emitter identifies the worn-sense input.
+ *
+ * Once the mapping is known, drop the channels that are not used — reading an
+ * unknown channel is harmless, but shipping fourteen of them is not tidy.
+ */
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+};
+
+/*
+ * LED ring — 12x SK6805-EC15 on P0.02 via R15 (510R) to LED1.DIN.
+ *
+ * MUST be SPIM30. This is not a style choice and it cost hours to establish:
+ * PWM20/21/22 live at 0x500Dxxxx and CANNOT reach P0, which is in the "30"
+ * domain at 0x5010xxxx. Measured 2026-08-29 — PWM reported a full DMA AMOUNT
+ * and SEQEND every frame while driving the pad with 0 highs out of 199 samples.
+ * Zephyr's own DK board file states the same rule. Bit-banging is out too: a
+ * GPIO write to P0 costs ~25-40 cycles even with ICACHE on, flooring the high
+ * time near 1.6 us against a 0.45 us budget.
+ *
+ * Frame timing below reproduces the values MEASURED to work on this ring:
+ *   8 MHz SPI (16 MHz / 2 — an achievable SPIM prescaler; 6.4 MHz is not),
+ *   8 SPI bits per LED bit => 125 ns per SPI bit, 1.0 us per LED bit.
+ *   zero-frame 0xC0 = 2 bits = 0.25 us  [verified as a zero]
+ *   one-frame  0xFC = 6 bits = 0.75 us  [verified as a one]
+ * T1H of 0.75 us is ABOVE the SK6805 datasheet nominal. 0.5 us is inside the
+ * datasheet window and this chain decodes it as a ZERO — the whole ring went
+ * dark while still accepting frames. Do not "correct" these toward the
+ * datasheet. See docs/agent-notes.md, 2026-08-29.
+ */
+&spi30 {
+	status = "okay";
+	pinctrl-0 = <&spi30_default>;
+	pinctrl-1 = <&spi30_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	led_ring: ws2812@0 {
+		compatible = "worldsemi,ws2812-spi";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		chain-length = <12>;
+		color-mapping = <LED_COLOR_ID_GREEN
+				 LED_COLOR_ID_RED
+				 LED_COLOR_ID_BLUE>;
+		spi-one-frame = <0xFC>;
+		spi-zero-frame = <0xC0>;
+		reset-delay = <300>;
+	};
+};
+
+/*
+ * IMU — LIS3DHTR (U6) on the shared SPI bus with the WM02C's QSPI.
+ * [from schematic] SCK P1.11, MOSI P1.06, MISO P1.07, CS P0.00.
+ * NOTE the CS is on a different GPIO port from the bus pins; cs-gpios is a
+ * software GPIO toggle so that is legal, but it is UNVERIFIED on hardware.
+ * TODO(hw): the bus is shared with WiFi QSPI — arbitration is a chunk-I
+ * problem and is not solved here.
+ */
+&spi21 {
+	status = "okay";
+	pinctrl-0 = <&spi21_default>;
+	pinctrl-1 = <&spi21_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+
+	imu: lis2dh@0 {
+		/* TODO(api): Zephyr ships "st,lis2dh" which covers the LIS3DH
+		 * family; the fitted part is a LIS3DHTR. Verify the driver
+		 * actually matches this part's WHO_AM_I before trusting data. */
+		compatible = "st,lis2dh";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		/* IMU INT1 on P1.14 — motion wake source (v2 §8.4). The net is
+		 * named IMU_ESP_INT in the schematic; that is a leftover and it
+		 * is not an ESP interrupt. */
+		irq-gpios = <&gpio1 14 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+};
+
+/*
+ * Servo — anchor role only (v2 §4.9 strap lock). P1.02, pad A8.
+ * P1 is in the PWM20 domain so PWM is available here, unlike the LED ring.
+ * The 3-wire lead is SOLDERED to U1's pads; the header is never populated.
+ * U1 pin 2 is /VBAT direct — no switch, no fuse, no current limit — so the
+ * servo rail CANNOT be cut in software and a stall is unbounded by anything
+ * firmware controls (§7). Do not write a recovery path that cannot work.
+ */
+&pwm20 {
+	status = "okay";
+	pinctrl-0 = <&pwm20_default>;
+	pinctrl-1 = <&pwm20_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&uart20 { status = "disabled"; };
+&uart30 { status = "disabled"; };
+
+#include <vendor/nordic/nrf54lm20a_cpuapp_partition.dtsi>
