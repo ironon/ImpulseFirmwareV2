@@ -652,6 +652,31 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 
 	LOG_INF("CS: peer lost (reason 0x%02X) — restarting engine", reason);
 
+	/*
+	 * FREE THE RAS INITIATOR FIRST. bt_ras_rreq_alloc_and_assign_handles()
+	 * takes its OWN bt_conn_ref() (ras_rreq.c: rreq->conn =
+	 * bt_conn_ref(conn)), and bt_ras_rreq_free() is the only thing that
+	 * ever releases it. Without this the conn object is never recycled: it
+	 * sits in the pool DISCONNECTED with ref=1 forever, and every later
+	 * bt_conn_le_create() to that peer is refused with
+	 *
+	 *   bt_conn: Found valid connection (...) in disconnected state
+	 *
+	 * which the scan module reports as a connect failure. The watch then
+	 * scans, matches, fails and rescans in a ~30 ms loop for the rest of
+	 * the boot — never reaching the anchor again, flooding RTT (440 KB in
+	 * 80 s, measured) and burning the battery, while still answering its
+	 * own GATT so it looks merely idle.
+	 *
+	 * Nordic's ras_initiator sample calls this in its disconnected
+	 * callback AND reboots on every disconnect, so the leak is invisible
+	 * there. We removed the reboot — correctly, it ended enforcement
+	 * remotely — which turned a masked leak into a permanent one.
+	 *
+	 * Measured on hardware 2026-09-12: acl_conns[1] DISCONNECTED, ref=1.
+	 */
+	bt_ras_rreq_free(conn);
+
 	bt_conn_unref(conn);
 	connection = NULL;
 
@@ -811,17 +836,56 @@ static void scan_filter_match(struct bt_scan_device_info *device_info,
 	LOG_INF("Filters matched. Address: %s connectable: %d", addr, connectable);
 }
 
-static void scan_connecting_error(struct bt_scan_device_info *device_info)
+/* Set by impulse_cs_set_ranging(); read here because a connect failure must
+ * not restart a scan that nothing is waiting on. */
+static bool g_ranging_wanted;
+
+/*
+ * A failed connect must cost something, and must not happen at all when no
+ * commitment wants a distance.
+ *
+ * This used to restart the scan immediately and unconditionally. Both halves
+ * were wrong. Unconditionally, because the scan kept running after the window
+ * closed — the watch was observed spinning in DORMANT, long past any need for
+ * a measurement. Immediately, because with connect failing every time (a
+ * leaked conn, above) match -> fail -> rescan closed in about 30 ms, which
+ * flooded RTT with 440 KB in 80 s, hid every other log line behind it, and
+ * drained the battery for no work at all.
+ *
+ * The backoff is deliberately modest: a genuine transient — the anchor
+ * rebooting, a collision — should still reconnect within a second or two,
+ * because a watch that cannot find its anchor is a commitment that is not
+ * being enforced. It only has to be slow enough that a PERMANENT failure
+ * cannot saturate the CPU and the log.
+ */
+#define SCAN_RETRY_DELAY_MS 500
+
+static void scan_retry_work_handler(struct k_work *w)
 {
 	int err;
 
-	LOG_INF("Connecting failed, restarting scanning");
+	ARG_UNUSED(w);
 
-	err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
-	if (err) {
-		LOG_ERR("Failed to restart scanning (err %i)", err);
+	if (!g_ranging_wanted) {
 		return;
 	}
+
+	err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
+	if (err != 0 && err != -EALREADY) {
+		LOG_ERR("Failed to restart scanning (err %i)", err);
+	}
+}
+
+static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_work_handler);
+
+static void scan_connecting_error(struct bt_scan_device_info *device_info)
+{
+	ARG_UNUSED(device_info);
+
+	LOG_INF("Connecting failed, retrying scan in %d ms",
+		SCAN_RETRY_DELAY_MS);
+
+	(void)k_work_reschedule(&scan_retry_work, K_MSEC(SCAN_RETRY_DELAY_MS));
 }
 
 static void scan_connecting(struct bt_scan_device_info *device_info, struct bt_conn *conn)
@@ -953,7 +1017,6 @@ static void distance_estimates_print(uint8_t ap)
  * a brief alarm at window start — which is the safe direction and consistent
  * with §4.5. Do not "fix" it by reporting compliance while the buffer fills.
  */
-static bool g_ranging_wanted;
 static bool g_procedures_on;
 
 static void apply_ranging_state(void)
@@ -1113,6 +1176,10 @@ restart:
 	if (connection != NULL) {
 		(void)bt_conn_disconnect(connection,
 					 BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		/* Same reference as in disconnected_cb — the engine tearing the
+		 * link down itself must release it too, or ending a window
+		 * leaks the conn exactly as losing the peer did. */
+		bt_ras_rreq_free(connection);
 		bt_conn_unref(connection);
 		connection = NULL;
 	}

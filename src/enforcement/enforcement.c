@@ -229,6 +229,17 @@ uint32_t impulse_enforcement_poll_interval_s(
 	if (!ctx->prox.have_verdict) {
 		return IMPULSE_ENFORCEMENT_POLL_NOT_MET_S;
 	}
+
+	/*
+	 * Mid-abstention with output running: the fastest cadence. This is the
+	 * user walking out of the room while the alarm sounds — the link drops,
+	 * every poll abstains, and only abstentions can release the criterion.
+	 * Polling that at 60 s made leaving take six minutes to register.
+	 */
+	if (!ctx->condition_met && ctx->prox.abstain_run > 0U) {
+		return IMPULSE_ENFORCEMENT_POLL_ABSTAIN_S;
+	}
+
 	return ctx->condition_met ? IMPULSE_ENFORCEMENT_POLL_MET_S
 				  : IMPULSE_ENFORCEMENT_POLL_NOT_MET_S;
 }

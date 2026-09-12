@@ -688,6 +688,44 @@ static void test_enforcement_outputs(void)
 		      "entering a window WORN opens the donning grace");
 	}
 
+	/*
+	 * Cadence while abstaining mid-alarm. getAway can only release through
+	 * the abstention fail-safe (the link is gone, so there are no AWAY
+	 * measurements to dwell on), and at the 60 s NOT_MET cadence that took
+	 * CS_ABSTAIN_MAX_CONSECUTIVE + 1 = 6 polls = six minutes.
+	 */
+	{
+		struct impulse_enforcement_ctx c2;
+
+		impulse_enforcement_init(&c2);
+		impulse_enforcement_enter(&c2, &e, 1000, false);
+		c2.prox.have_verdict = true;
+		c2.prox.verdict = IMPULSE_PROX_NEAR;
+		(void)impulse_enforcement_check_condition(&c2, 1000, false,
+							  NULL, true);
+		CHECK(c2.condition_met == false, "alarm is running");
+		CHECK(impulse_enforcement_poll_interval_s(&c2) ==
+			      IMPULSE_ENFORCEMENT_POLL_NOT_MET_S,
+		      "a settled not-met verdict keeps the normal cadence");
+
+		/* The user walks out: the link drops and polls start abstaining. */
+		c2.prox.abstain_run = 1;
+		CHECK(impulse_enforcement_poll_interval_s(&c2) ==
+			      IMPULSE_ENFORCEMENT_POLL_ABSTAIN_S,
+		      "abstaining mid-alarm polls at the fast cadence");
+
+		/* Releasing must still cost the full dwell, just not the wall
+		 * clock — abstention is not free (§4.5). */
+		CHECK(IMPULSE_ENFORCEMENT_POLL_ABSTAIN_S *
+			      (IMPULSE_CS_ABSTAIN_MAX_CONSECUTIVE + 1) <= 90U,
+		      "leaving the room releases within ~a minute");
+
+		c2.condition_met = true;
+		CHECK(impulse_enforcement_poll_interval_s(&c2) ==
+			      IMPULSE_ENFORCEMENT_POLL_MET_S,
+		      "a met condition is never put on the fast cadence");
+	}
+
 	/* A no-active-event exit must settle too. */
 	ctx.active = NULL;
 	CHECK(impulse_enforcement_check_condition(&ctx, 2000, false, NULL,

@@ -27,6 +27,30 @@ enum impulse_state {
  * measurement (v3 §4.3). */
 #define IMPULSE_ENFORCEMENT_POLL_NOT_MET_S 60U
 #define IMPULSE_ENFORCEMENT_POLL_MET_S     180U
+
+/*
+ * ABSTAINING WHILE THE ALARM IS RUNNING IS THE URGENT CASE, NOT THE IDLE ONE.
+ *
+ * getAway can essentially never resolve by the normal route: channel sounding
+ * needs the BLE link, so walking out of the room DESTROYS the measurement
+ * rather than producing a large one. AWAY_DWELL is unreachable in practice and
+ * the criterion can only release through the abstention fail-safe — which
+ * needs CS_ABSTAIN_MAX_CONSECUTIVE + 1 = 6 polls.
+ *
+ * At the NOT_MET cadence that is 6 x 60 s = SIX MINUTES of alarm after the
+ * user has already done the thing the alarm was demanding. Observed on
+ * hardware 2026-09-12: the user left the room and gave up and hit reset at
+ * about two minutes, which is entirely reasonable — a feedback loop nobody can
+ * perceive is not enforcing anything, it is just noise.
+ *
+ * At 10 s the same six polls resolve in about a minute. The trade-off is
+ * deliberate and worth stating: ABSTAIN_MAX exists so that jamming the radio
+ * is not a free bypass (§4.5), and this makes that bypass cost ~60 s rather
+ * than ~6 min. It is still a cost, and it is bounded by the same dwell count;
+ * only the clock changed. Do not raise it back without re-reading §4.5 and
+ * asking what a user is supposed to learn from an alarm that ignores them.
+ */
+#define IMPULSE_ENFORCEMENT_POLL_ABSTAIN_S 10U
 #define IMPULSE_PHONE_AWAY_TOLERANCE_S     60U
 /* §3.2: wake this far before a boundary and poll into it. Not drift
  * compensation — the LFXO makes drift negligible — but insurance against
