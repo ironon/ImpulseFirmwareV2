@@ -252,6 +252,47 @@ config IMPULSE_SYSWORKQ_STALL_S
 	  submitted every quarter of this interval, so the true detection window
 	  is between 0.75x and 1x this value.
 
+config IMPULSE_HW_WATCHDOG
+	bool "Hardware watchdog (WDT31), fed from the main loop"
+	default y
+	select WATCHDOG
+	help
+	  Resets the device if the main loop stops running.
+
+	  CONFIG_IMPULSE_SYSWORKQ_WATCHDOG cannot catch this class of failure,
+	  because it lives in the main loop it would need to be running in. On
+	  2026-09-12 the watch halted on a SoftDevice Controller assert (23, 587):
+	  interrupts locked, system tick stopped, every thread frozen — and the
+	  vibration motor latched ON, because the last value written to the pad
+	  simply stayed there. Nothing in software could notice. Only reset
+	  stopped it. An earlier ~10-hour wedge inside a controller ISR had the
+	  same property.
+
+	  The watchdog is paused while a debugger holds the CPU halted, so SWD
+	  inspection never trips it. It is NOT paused by a firmware halt, which is
+	  why IMPULSE_HALT_ON_FATAL cannot be combined with it.
+
+config IMPULSE_HW_WATCHDOG_TIMEOUT_S
+	int "Hardware watchdog timeout, seconds"
+	depends on IMPULSE_HW_WATCHDOG
+	range 10 120
+	default 30
+	help
+	  Must exceed the longest legitimate block in the main loop. That is
+	  the channel sounding measure wait (IMPULSE_CS_MEASURE_WAIT_MS, 8 s);
+	  30 s leaves wide margin without leaving a latched motor running for
+	  long.
+
+config IMPULSE_HALT_ON_FATAL
+	bool "Halt instead of rebooting on a fatal error (bench only)"
+	depends on !IMPULSE_HW_WATCHDOG
+	help
+	  Keeps a crashed device frozen so its thread states, fault registers
+	  and unflushed RTT buffer can be read over SWD — which is exactly how
+	  the 2026-09-12 controller assert was identified. Outputs are still
+	  forced off first either way. Never ship this: a halted watch enforces
+	  nothing until someone presses reset.
+
 config IMPULSE_MAX_EVENTS_PER_DAY
 	int "Maximum events resolved for a single day"
 	default 32

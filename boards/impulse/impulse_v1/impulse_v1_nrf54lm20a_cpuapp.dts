@@ -278,3 +278,9 @@
 &uart30 { status = "disabled"; };
 
 #include <vendor/nordic/nrf54lm20a_cpuapp_partition.dtsi>
+
+/* Hardware watchdog. The SoC dtsi leaves it disabled; see
+ * CONFIG_IMPULSE_HW_WATCHDOG for why the product needs it. */
+&wdt31 {
+	status = "okay";
+};

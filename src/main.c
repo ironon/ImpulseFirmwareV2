@@ -19,6 +19,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/reboot.h>
 
+#include "fatal.h"
+
 #include "enforcement/enforcement.h"
 #include "hal/hal.h"
 #include "integrity/integrity.h"
@@ -952,6 +954,91 @@ static void sysworkq_probe_handler(struct k_work *w)
 static K_WORK_DEFINE(g_sysworkq_probe, sysworkq_probe_handler);
 #endif /* CONFIG_IMPULSE_SYSWORKQ_WATCHDOG */
 
+/*
+ * STATUS RING.
+ *
+ * Solid red while the user is not complying with a commitment being enforced;
+ * flashing green while a window is open and they are. Dark otherwise — v3
+ * §6.2 keeps the ring off in DORMANT, and this does not change that.
+ *
+ * On the watch that is the enforcement verdict itself. The anchor does not
+ * enforce (v3 §4.2), so on the anchor red means its removal alarm is sounding
+ * and green means a window involving it is open and quiet.
+ *
+ * The ring is only written when the wanted frame changes. A write is a full
+ * SPI transfer of all twelve pixels and this runs every loop pass; resending
+ * an identical frame ten times a second would be pure waste on a bus the
+ * clock display also uses. The short-press clock owns the ring while its
+ * timer is pending, and its handler clears the ring on the system workqueue —
+ * so the cached frame is invalidated then, and the status is re-sent once the
+ * clock has handed the ring back.
+ */
+#define STATUS_RING_BRIGHTNESS 40
+#define STATUS_RING_FLASH_MS   500
+
+enum status_ring_frame {
+	STATUS_RING_OFF,
+	STATUS_RING_RED,
+	STATUS_RING_GREEN_ON,
+	STATUS_RING_GREEN_OFF,
+};
+
+static void update_status_ring(int64_t now_ms)
+{
+	static int last = -1;
+	bool alarm = false;
+	bool compliant = false;
+	int want;
+
+	if (k_work_delayable_busy_get(&clock_off_work) != 0) {
+		last = -1;
+		return;
+	}
+
+#if defined(CONFIG_IMPULSE_ROLE_ANCHOR)
+	if (impulse_anchor_beep_state()->active) {
+		alarm = true;
+	} else if (impulse_app_anchor_in_active_event()) {
+		compliant = true;
+	}
+#else
+	if (g_enf.state == IMPULSE_STATE_ENFORCEMENT) {
+		if (g_enf.condition_met) {
+			compliant = true;
+		} else {
+			alarm = true;
+		}
+	}
+#endif
+
+	if (alarm) {
+		want = STATUS_RING_RED;
+	} else if (compliant) {
+		want = ((now_ms % (2 * STATUS_RING_FLASH_MS)) <
+			STATUS_RING_FLASH_MS) ? STATUS_RING_GREEN_ON
+					      : STATUS_RING_GREEN_OFF;
+	} else {
+		want = STATUS_RING_OFF;
+	}
+
+	if (want == last) {
+		return;
+	}
+
+	switch (want) {
+	case STATUS_RING_RED:
+		(void)impulse_led_ring_set_all(STATUS_RING_BRIGHTNESS, 0, 0);
+		break;
+	case STATUS_RING_GREEN_ON:
+		(void)impulse_led_ring_set_all(0, STATUS_RING_BRIGHTNESS, 0);
+		break;
+	default:
+		(void)impulse_led_ring_clear();
+		break;
+	}
+	last = want;
+}
+
 int main(void)
 {
 	int err;
@@ -962,6 +1049,9 @@ int main(void)
 	if (err != 0) {
 		LOG_ERR("outputs init failed (%d)", err);
 	}
+
+	/* Before anything else can fail: say how the last boot ended. */
+	impulse_fatal_report_boot();
 
 	err = impulse_led_ring_init();
 	if (err != 0) {
@@ -1149,6 +1239,8 @@ int main(void)
 	}
 #endif
 
+	impulse_hw_watchdog_start();
+
 	int64_t last_tick = k_uptime_get();
 	int64_t last_poll = 0;
 	int64_t last_beat = 0;
@@ -1167,6 +1259,7 @@ int main(void)
 		uint32_t dt = (uint32_t)(now_ms - last_tick);
 
 		last_tick = now_ms;
+		impulse_hw_watchdog_feed();
 
 #if defined(CONFIG_IMPULSE_SYSWORKQ_WATCHDOG)
 		{
@@ -1342,6 +1435,8 @@ int main(void)
 			impulse_buzzer_set(false);
 		}
 #endif /* CONFIG_IMPULSE_ROLE_ANCHOR */
+
+		update_status_ring(now_ms);
 
 		/*
 		 * Battery and worn sampling, once a second.

@@ -289,6 +289,44 @@ static int cmd_worn(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/*
+ * DELIBERATE FAILURES. A fatal handler or a watchdog that has never fired is a
+ * claim, not a feature — these exist to prove both on real hardware. Each
+ * drives the motor first, because the failure being guarded against is a
+ * crashed device with the motor latched on (2026-09-12, SDC assert 23/587).
+ */
+static int cmd_crash(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	shell_print(sh, "motor ON, then kernel panic — expect a reboot and a "
+			"PREVIOUS BOOT CRASHED report");
+	impulse_motor_set(true);
+	k_sleep(K_MSEC(300));
+	k_panic();
+	return 0;
+}
+
+static int cmd_hang(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+#if defined(CONFIG_IMPULSE_HW_WATCHDOG)
+	shell_print(sh, "motor ON, interrupts locked forever — only the hardware "
+			"watchdog can recover, in ~%d s",
+		    CONFIG_IMPULSE_HW_WATCHDOG_TIMEOUT_S);
+#else
+	shell_print(sh, "motor ON, interrupts locked forever — NO hardware "
+			"watchdog in this build, so only reset recovers");
+#endif
+	k_sleep(K_MSEC(300));
+	impulse_motor_set(true);
+	(void)irq_lock();
+	for (;;) {
+	}
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	sub_impulse,
 	SHELL_CMD_ARG(buzz, NULL, "buzz [ms]", cmd_buzz, 1, 1),
@@ -305,6 +343,12 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(worn, NULL, "pulse the IR emitter", cmd_worn, 1, 0),
 	SHELL_CMD_ARG(wornset, NULL, "wornset <0|1|auto> — override the worn sensor",
 		      cmd_wornset, 1, 1),
+	SHELL_CMD_ARG(crash, NULL,
+		      "BENCH: motor on + kernel panic (proves the fatal handler)",
+		      cmd_crash, 1, 0),
+	SHELL_CMD_ARG(hang, NULL,
+		      "BENCH: motor on + irqs locked (proves the hardware watchdog)",
+		      cmd_hang, 1, 0),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(impulse, &sub_impulse, "Board V1 bring-up", NULL);

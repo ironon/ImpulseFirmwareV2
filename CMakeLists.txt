@@ -27,6 +27,7 @@ target_sources(app PRIVATE
     src/hal/buttons.c
     src/hal/adc.c
     src/hal/servo.c
+    src/fatal.c
 )
 
 target_sources_ifdef(CONFIG_IMPULSE_ROLE_ANCHOR app PRIVATE

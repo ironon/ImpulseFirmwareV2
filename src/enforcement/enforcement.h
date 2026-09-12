@@ -38,10 +38,16 @@ enum impulse_state {
  * needs CS_ABSTAIN_MAX_CONSECUTIVE + 1 = 6 polls.
  *
  * At the NOT_MET cadence that is 6 x 60 s = SIX MINUTES of alarm after the
- * user has already done the thing the alarm was demanding. Observed on
- * hardware 2026-09-12: the user left the room and gave up and hit reset at
- * about two minutes, which is entirely reasonable — a feedback loop nobody can
- * perceive is not enforcing anything, it is just noise.
+ * user has already done the thing the alarm was demanding — a feedback loop
+ * nobody can perceive is not enforcing anything, it is just noise.
+ *
+ * CORRECTION, 2026-09-12. This was first justified by a hardware test in which
+ * the alarm "did not stop when the user left the room, only on reset". That
+ * observation was NOT this timeout: read over SWD, the watch had halted on a
+ * SoftDevice Controller assert (23, 587) with the motor pad latched on, which
+ * is exactly the "only reset stops it" signature. The arithmetic above still
+ * stands on its own and the faster cadence is still right, but no hardware
+ * measurement has yet shown this path being slow. See agent-notes.
  *
  * At 10 s the same six polls resolve in about a minute. The trade-off is
  * deliberate and worth stating: ABSTAIN_MAX exists so that jamming the radio
