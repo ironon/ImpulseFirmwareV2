@@ -3,6 +3,7 @@
 #
 #   ./build.sh watch                   # plain watch
 #   ./build.sh watch --cs              # + channel sounding (initiator)
+#   ./build.sh watch --cs --buzzer     # + the buzzer compiled back IN
 #   ./build.sh watch --cs --wifi       # + WiFi (WM02C)
 #   ./build.sh anchor --cs --wifi      # anchor: CS reflector + WiFi
 #   ./build.sh watch --cs -p always    # pristine; west args pass through
@@ -26,12 +27,13 @@ SUFFIX=""
 # CS is the initiator on the watch and the reflector on the anchor — the same
 # flag, because "does this build do channel sounding" is the question a caller
 # actually has.
-WANT_CS=0; WANT_WIFI=0; WANT_COEX=0; WEST_ARGS=()
+WANT_CS=0; WANT_WIFI=0; WANT_COEX=0; WANT_BUZZER=0; WEST_ARGS=()
 for a in "$@"; do
   case "$a" in
     --cs)   WANT_CS=1 ;;
     --wifi) WANT_WIFI=1 ;;
     --coex) WANT_COEX=1 ;;
+    --buzzer) WANT_BUZZER=1 ;;
     *)      WEST_ARGS+=("$a") ;;
   esac
 done
@@ -62,6 +64,13 @@ if [ "$WANT_COEX" = 1 ]; then
   CONFS="$CONFS;coex.conf"
   OVERLAYS="$OVERLAYS;$HERE/coex.overlay"
   SUFFIX="${SUFFIX}coex"
+fi
+
+# Sound is opt-in and shows up in the build directory name, so a silent board
+# is never a mystery: build-watch-cs cannot beep, build-watch-cs-buzz can.
+if [ "$WANT_BUZZER" = 1 ]; then
+  CONFS="$CONFS;buzzer_on.conf"
+  SUFFIX="${SUFFIX}-buzz"
 fi
 
 BUILD_DIR="$HERE/build-$ROLE${SUFFIX:+-$SUFFIX}"
