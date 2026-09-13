@@ -1421,11 +1421,26 @@ int main(void)
 				 */
 				if (impulse_criteria_is_anchor_based(
 					    g_enf.active->criteria)) {
-					struct impulse_cs_measurement m;
+					struct impulse_cs_link_obs pobs;
 
-					impulse_cs_backend()->measure(
-						g_enf.active->anchor_id, &m);
-					impulse_prox_ingest(&g_enf.prox, &m);
+					impulse_cs_link_observe(&pobs);
+					if (pobs.known) {
+						/* Per-burst dwell (v0.17):
+						 * bursts are ingested every
+						 * pass below; the poll only
+						 * charges an abstention for an
+						 * interval that produced none. */
+						impulse_enforcement_poll_abstain_if_idle(
+							&g_enf);
+					} else {
+						struct impulse_cs_measurement m;
+
+						impulse_cs_backend()->measure(
+							g_enf.active->anchor_id,
+							&m);
+						impulse_prox_ingest(&g_enf.prox,
+								    &m);
+					}
 				}
 
 				/* TODO(chunk I): real WiFi state and dock
@@ -1506,6 +1521,18 @@ int main(void)
 				bool was_met = g_enf.condition_met;
 
 				impulse_cs_link_observe(&obs);
+				if (impulse_enforcement_burst_update(
+					    &g_enf, &obs, now_ms, now_utc()) &&
+				    g_enf.condition_met != was_met) {
+					LOG_INF("burst %u cm: criterion now %s "
+						"(near_run %u away_run %u)",
+						obs.result_cm,
+						g_enf.condition_met ? "MET"
+								    : "NOT met",
+						g_enf.prox.near_run,
+						g_enf.prox.away_run);
+					was_met = g_enf.condition_met;
+				}
 				impulse_enforcement_link_update(&g_enf, &obs,
 								now_ms,
 								now_utc());

@@ -13,6 +13,8 @@ static void link_reset(struct impulse_enforcement_ctx *ctx)
 	ctx->link_grace_after_ms = 0;
 	ctx->link_grace_deadline_ms = 0;
 	ctx->link_grace_cooldown_until_ms = 0;
+	ctx->burst_last_ms = 0;
+	ctx->bursts_since_poll = 0;
 }
 
 void impulse_enforcement_init(struct impulse_enforcement_ctx *ctx)
@@ -258,6 +260,14 @@ uint32_t impulse_enforcement_poll_interval_s(
 				  : IMPULSE_ENFORCEMENT_POLL_NOT_MET_S;
 }
 
+static void link_arm(struct impulse_enforcement_ctx *ctx, int64_t now_ms)
+{
+	if (!ctx->link_armed) {
+		ctx->link_armed = true;
+		ctx->link_window_start_ms = now_ms;
+	}
+}
+
 static void conclude_away(struct impulse_enforcement_ctx *ctx, int64_t now_utc)
 {
 	ctx->link_grace = false;
@@ -282,10 +292,7 @@ void impulse_enforcement_link_update(struct impulse_enforcement_ctx *ctx,
 		return;
 	}
 
-	if (!ctx->link_armed) {
-		ctx->link_armed = true;
-		ctx->link_window_start_ms = now_ms;
-	}
+	link_arm(ctx, now_ms);
 
 	/* Activity from before this window — the link the previous window was
 	 * releasing — is not a link this window ever had, so it cannot be lost.
@@ -359,4 +366,55 @@ bool impulse_enforcement_output_silenced(
 	const struct impulse_enforcement_ctx *ctx)
 {
 	return ctx->state == IMPULSE_STATE_ENFORCEMENT && ctx->link_grace;
+}
+
+bool impulse_enforcement_burst_update(struct impulse_enforcement_ctx *ctx,
+				      const struct impulse_cs_link_obs *obs,
+				      int64_t now_ms, int64_t now_utc)
+{
+	const struct impulse_event *e = ctx->active;
+
+	if (ctx->state != IMPULSE_STATE_ENFORCEMENT || e == NULL ||
+	    !impulse_criteria_is_anchor_based(e->criteria) || obs == NULL ||
+	    !obs->known) {
+		return false;
+	}
+
+	link_arm(ctx, now_ms);
+
+	/* Only bursts that completed during this window, each exactly once. A
+	 * result left over from the previous window is not a measurement of
+	 * this commitment. */
+	if (!obs->have_result || obs->result_ms < ctx->link_window_start_ms ||
+	    obs->result_ms <= ctx->burst_last_ms) {
+		return false;
+	}
+
+	struct impulse_cs_measurement m;
+
+	memset(&m, 0, sizeof(m));
+	m.result = IMPULSE_CS_OK;
+	m.distance_cm = obs->result_cm;
+
+	ctx->burst_last_ms = obs->result_ms;
+	if (ctx->bursts_since_poll < UINT16_MAX) {
+		ctx->bursts_since_poll++;
+	}
+	impulse_prox_ingest(&ctx->prox, &m);
+	(void)impulse_enforcement_check_condition(ctx, now_utc, false, NULL,
+						  true);
+	return true;
+}
+
+void impulse_enforcement_poll_abstain_if_idle(
+	struct impulse_enforcement_ctx *ctx)
+{
+	if (ctx->bursts_since_poll == 0U) {
+		struct impulse_cs_measurement m;
+
+		memset(&m, 0, sizeof(m));
+		m.result = IMPULSE_CS_FAIL_PROCEDURE;
+		impulse_prox_ingest(&ctx->prox, &m);
+	}
+	ctx->bursts_since_poll = 0;
 }

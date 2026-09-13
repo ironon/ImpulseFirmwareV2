@@ -917,6 +917,79 @@ static void test_link_loss(void)
 	      "backend: no telemetry, no lost-link rule");
 }
 
+/* ---- per-burst dwell (v3 §4.4, v0.17) ------------------------------------ */
+
+static void burst(struct impulse_enforcement_ctx *c,
+		  struct impulse_cs_link_obs *o, int64_t t_ms, uint32_t cm)
+{
+	o->activity_seen = true;
+	o->last_activity_ms = t_ms;
+	o->have_result = true;
+	o->result_ms = t_ms;
+	o->result_cm = cm;
+	(void)impulse_enforcement_burst_update(c, o, t_ms, t_ms / 1000);
+	impulse_enforcement_link_update(c, o, t_ms, t_ms / 1000);
+}
+
+static void test_burst_dwell(void)
+{
+	struct impulse_enforcement_ctx c;
+	struct impulse_cs_link_obs o;
+	struct impulse_event e = mk_event(4, 0, 1440, 0);
+
+	e.criteria = IMPULSE_CRIT_GET_AWAY;
+	e.profile = IMPULSE_PROFILE_STRICT_BOTH;
+	impulse_enforcement_init(&c);
+	impulse_enforcement_enter(&c, &e, 1, false);
+	memset(&o, 0, sizeof(o));
+	o.known = true;
+	o.have_result = true;
+	o.result_ms = 400; /* left over from before the window */
+	o.result_cm = 10;
+	CHECK(!impulse_enforcement_burst_update(&c, &o, 1000, 1),
+	      "burst: a result from before the window is not ingested");
+
+	/* The 01:01 failure: bursts at 0-15 cm, no poll ever lining up. */
+	burst(&c, &o, 4600, 15);
+	CHECK(!c.prox.have_verdict && c.condition_met,
+	      "burst: one near burst is not yet a verdict (fail-open green)");
+	CHECK(!impulse_enforcement_burst_update(&c, &o, 5000, 5),
+	      "burst: the same burst is never ingested twice");
+	burst(&c, &o, 8200, 0);
+	CHECK(c.prox.have_verdict && c.prox.verdict == IMPULSE_PROX_NEAR,
+	      "burst: two consecutive near bursts form NEAR, no poll needed");
+	CHECK(!c.condition_met, "burst: getAway goes unmet on that pass");
+	(void)impulse_enforcement_tick(&c, 100);
+	CHECK(c.profile_run.motor_on, "burst: and the alarm starts at once");
+
+	/* A poll after bursts is not an abstention; an idle one is. */
+	impulse_enforcement_poll_abstain_if_idle(&c);
+	CHECK(c.prox.abstain_run == 0, "burst: a poll that saw bursts abstains nothing");
+	impulse_enforcement_poll_abstain_if_idle(&c);
+	CHECK(c.prox.abstain_run == 1, "burst: an idle poll interval is one abstention");
+
+	/* AWAY still needs double the evidence, now counted in bursts. */
+	burst(&c, &o, 11800, 500);
+	burst(&c, &o, 15400, 500);
+	burst(&c, &o, 19000, 500);
+	CHECK(!c.condition_met, "burst: three far bursts are not AWAY");
+	burst(&c, &o, 22600, 500);
+	CHECK(c.condition_met && c.prox.verdict == IMPULSE_PROX_AWAY,
+	      "burst: the fourth far burst concludes AWAY");
+	CHECK(c.prox.abstain_run == 0, "burst: a measurement clears the abstain run");
+
+	/* Walking back in re-alarms in two bursts, not two 180 s polls. */
+	burst(&c, &o, 26200, 50);
+	burst(&c, &o, 29800, 50);
+	CHECK(!c.condition_met, "burst: two near bursts after AWAY re-alarm");
+
+	/* Telemetry-less backends keep the poll-driven path. */
+	o.known = false;
+	o.result_ms = 40000;
+	CHECK(!impulse_enforcement_burst_update(&c, &o, 40000, 40),
+	      "burst: no telemetry, no per-burst ingest");
+}
+
 int main(void)
 {
 	printf("impulse host tests\n\n");
@@ -931,6 +1004,7 @@ int main(void)
 	test_cs_fuse();
 	test_enforcement_outputs();
 	test_link_loss();
+	test_burst_dwell();
 
 	printf("\n%d checks, %d failed\n", g_run, g_fail);
 	return g_fail == 0 ? 0 : 1;

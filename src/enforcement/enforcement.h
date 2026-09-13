@@ -112,6 +112,10 @@ struct impulse_enforcement_ctx {
 	int64_t link_grace_after_ms;   /* only results newer than this count */
 	int64_t link_grace_deadline_ms;
 	int64_t link_grace_cooldown_until_ms;
+
+	/* Per-burst dwell (v3 §4.4, v0.17). */
+	int64_t burst_last_ms;      /* completion time of the last ingested burst */
+	uint16_t bursts_since_poll; /* bursts ingested since the last poll */
 };
 
 void impulse_enforcement_init(struct impulse_enforcement_ctx *ctx);
@@ -146,6 +150,31 @@ uint32_t impulse_enforcement_poll_interval_s(
 void impulse_enforcement_link_update(struct impulse_enforcement_ctx *ctx,
 				     const struct impulse_cs_link_obs *obs,
 				     int64_t now_ms, int64_t now_utc);
+
+/*
+ * PER-BURST DWELL (v3 §4.4, v0.17). Fold every newly completed burst into the
+ * verdict as it arrives and settle the criterion on the same pass. Returns
+ * true if a burst was ingested. Call every main-loop pass.
+ *
+ * NEAR_DWELL and AWAY_DWELL used to count enforcement POLLS, 60 s apart with no
+ * verdict and 180 s once compliant, with one burst sampled per poll. On this
+ * pair the link drops every ~25 s, so two consecutive good polls never
+ * happened: on 2026-09-13 at 01:01 a watch beside its anchor produced 17
+ * bursts at 0-15 cm, never formed a NEAR verdict, and sat in the getAway
+ * fail-open (green) for the whole window. Replaying the walk captures, per-poll
+ * AWAY was reached zero times. The 2:1 AWAY:NEAR ratio is unchanged.
+ */
+bool impulse_enforcement_burst_update(struct impulse_enforcement_ctx *ctx,
+				      const struct impulse_cs_link_obs *obs,
+				      int64_t now_ms, int64_t now_utc);
+
+/*
+ * The poll's half of per-burst dwell: a poll interval with no burst at all is
+ * ONE abstention (§4.5), so a silent radio still marches toward the fail-safe.
+ * Use instead of backend->measure() when the backend reports link telemetry.
+ */
+void impulse_enforcement_poll_abstain_if_idle(
+	struct impulse_enforcement_ctx *ctx);
 
 /* True while the lost-link grace holds the motor and buzzer off. The profile
  * keeps running underneath; the caller gates the pins, not the ring. */
