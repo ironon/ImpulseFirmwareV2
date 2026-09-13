@@ -649,11 +649,42 @@ static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, IMPULSE_UUID_WATCH_SVC),
 };
 
+/*
+ * ONLY THE APP'S LINK IS OURS. BT_CONN_CB_DEFINE callbacks fire for EVERY
+ * connection on the device — including the watch's own CENTRAL link to the
+ * anchor for channel sounding (cs_backend_nrf.c), which has its own callbacks.
+ *
+ * These used to take a reference on every connect, overwriting current_conn
+ * without releasing the previous one, and release current_conn on every
+ * disconnect whichever link had actually gone. When the app and the anchor
+ * link overlapped the app's reference leaked: its conn object stayed in the
+ * pool DISCONNECTED with ref=1 forever. With CONFIG_BT_MAX_CONN=2 and the
+ * other slot held by connectable advertising, the watch then had no conn
+ * object left for the anchor and failed every connect attempt, every 500 ms,
+ * for the rest of the boot — a real Sunrise Lock on 2026-09-13 went green 15 s
+ * in and never enforced again. Read over SWD: acl_conns[0] role=peripheral,
+ * state DISCONNECTED, ref=1, dst = the phone; acl_conns[1] ADV_CONNECTABLE.
+ */
+static bool is_app_link(struct bt_conn *conn)
+{
+	struct bt_conn_info info;
+
+	return bt_conn_get_info(conn, &info) == 0 &&
+	       info.role == BT_CONN_ROLE_PERIPHERAL;
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
+	if (!is_app_link(conn)) {
+		return;
+	}
 	if (err != 0U) {
 		LOG_WRN("connection failed (0x%02x)", err);
 		return;
+	}
+	if (current_conn != NULL) {
+		/* Cannot happen with one peripheral slot, but never leak. */
+		bt_conn_unref(current_conn);
 	}
 	current_conn = bt_conn_ref(conn);
 	LOG_INF("app connected");
@@ -690,20 +721,23 @@ static K_WORK_DEFINE(adv_restart_work, adv_restart_work_handler);
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(conn);
-	LOG_INF("app disconnected (0x%02x)", reason);
+	/* Any link going away frees a conn object, so try advertising again
+	 * whichever it was: a restart attempted while both slots were busy
+	 * failed and would otherwise never be retried. -EALREADY is benign. */
+	(void)k_work_submit(&adv_restart_work);
 
-	if (current_conn != NULL) {
-		bt_conn_unref(current_conn);
-		current_conn = NULL;
+	if (conn != current_conn) {
+		return; /* the anchor link; cs_backend_nrf.c owns it */
 	}
+
+	LOG_INF("app disconnected (0x%02x)", reason);
+	bt_conn_unref(current_conn);
+	current_conn = NULL;
 
 	/* An in-flight transfer does not survive the link. Keeping a partial
 	 * buffer would let the next connection END a schedule it never sent. */
 	sched_xfer.active = false;
 	sched_xfer.received = 0;
-
-	(void)k_work_submit(&adv_restart_work);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {

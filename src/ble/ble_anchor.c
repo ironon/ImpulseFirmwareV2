@@ -610,29 +610,44 @@ static void adv_restart_work_handler(struct k_work *w)
 					  K_MSEC(500));
 }
 
+/*
+ * NEVER OVERWRITE A HELD REFERENCE. The anchor is a peripheral to both the
+ * phone app and the ranging watch at once (CONFIG_BT_MAX_CONN=2), so this
+ * callback fires for both. It used to take a reference on every connect,
+ * overwriting anchor_conn and leaking the first link's reference, and to
+ * release anchor_conn on every disconnect whichever link had gone. A leaked
+ * conn sits in the pool DISCONNECTED with ref=1 forever, and with two slots
+ * that is half the anchor's connectivity for the rest of the boot. The same
+ * defect took down the watch on 2026-09-13 (ble_watch.c).
+ *
+ * TODO: with two peripheral links the notify target is whichever connected
+ * first, not necessarily the app. Telling them apart needs the app to identify
+ * itself (e.g. by the first write to our service); not solved here.
+ */
 static void anchor_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err != 0U) {
 		return;
 	}
-	anchor_conn = bt_conn_ref(conn);
+	if (anchor_conn == NULL) {
+		anchor_conn = bt_conn_ref(conn);
+	}
 	LOG_INF("anchor: peer connected");
 }
 
 static void anchor_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(conn);
 	LOG_INF("anchor: peer disconnected (0x%02x)", reason);
 
 	if (conn == dock_conn) {
 		dock_conn = NULL;
 	}
-	if (anchor_conn != NULL) {
+	if (conn == anchor_conn) {
 		bt_conn_unref(anchor_conn);
 		anchor_conn = NULL;
+		anchor_xfer.active = false;
+		anchor_xfer.received = 0;
 	}
-	anchor_xfer.active = false;
-	anchor_xfer.received = 0;
 	(void)k_work_reschedule_for_queue(&adv_wq, &adv_restart_work,
 					  K_NO_WAIT);
 }
