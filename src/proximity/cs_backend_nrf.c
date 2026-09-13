@@ -697,6 +697,22 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 
 	if (err) {
 		connection = NULL;
+		/*
+		 * WAKE THE ENGINE ON A FAILED CONNECTION TOO. The scan module
+		 * stops scanning when it initiates, and a connection that then
+		 * fails to establish (0x3E) or times out arrives HERE with
+		 * err != 0 — scan_connecting_error() only covers a synchronous
+		 * create failure. This used to return without a give, so the
+		 * engine sat in k_sem_take(&sem_connected, K_FOREVER) with
+		 * scanning stopped and never ranged again that boot.
+		 *
+		 * Observed 2026-09-13, mid Sunrise Lock: the anchor was
+		 * reflashed, the watch's reconnect failed to establish, and SWD
+		 * read impulse_cs pended on sem_connected, connection NULL,
+		 * bt_dev SCANNING=0, for 9 minutes — flashing green beside the
+		 * anchor. The engine sees connection == NULL and restarts.
+		 */
+		k_sem_give(&sem_connected);
 	} else if (connection == NULL) {
 		connection = bt_conn_ref(conn);
 		k_sem_give(&sem_connected);
@@ -937,6 +953,10 @@ static bool g_ranging_wanted;
  * cannot saturate the CPU and the log.
  */
 #define SCAN_RETRY_DELAY_MS 500
+
+/* How long the engine waits for a connection after starting a scan before it
+ * tears down and rescans. See the k_sem_take(&sem_connected) call. */
+#define IMPULSE_CS_CONNECT_WAIT_S 30
 
 static void scan_retry_work_handler(struct k_work *w)
 {
@@ -1370,7 +1390,14 @@ restart:
 	 * timing out here just tore the session down and rebuilt it on a loop.
 	 * Every wait AFTER this one is bounded, because once a peer has
 	 * answered, silence means the session is wedged. */
-	k_sem_take(&sem_connected, K_FOREVER);
+	/* Bounded, not K_FOREVER: any wake-up lost on a path not yet found
+	 * costs one rescan, not the rest of the boot. With no anchor in range
+	 * this cycles harmlessly every ~31 s. */
+	if (k_sem_take(&sem_connected, K_SECONDS(IMPULSE_CS_CONNECT_WAIT_S)) != 0) {
+		LOG_INF("CS: no connection in %d s — rescanning",
+			IMPULSE_CS_CONNECT_WAIT_S);
+		goto restart;
+	}
 	if (connection == NULL) {
 		goto restart;
 	}
