@@ -60,6 +60,29 @@ struct crash_record {
 
 static struct crash_record crash __noinit;
 
+#define REBOOT_MAGIC 0x494D5052U /* "IMPR" */
+
+/* Retained, so both are readable over SWD at any time, not only in a boot log
+ * that RTT has probably already lost. */
+static struct {
+	uint32_t magic;
+	uint32_t pending;
+	uint32_t uptime_ms;
+	char why[48];
+} reboot_note __noinit;
+
+uint32_t impulse_last_reset_cause __noinit;
+
+void impulse_note_reboot(const char *why)
+{
+	reboot_note.magic = REBOOT_MAGIC;
+	reboot_note.pending = 1U;
+	reboot_note.uptime_ms = (uint32_t)k_uptime_get();
+	(void)strncpy(reboot_note.why, (why != NULL) ? why : "?",
+		      sizeof(reboot_note.why) - 1U);
+	reboot_note.why[sizeof(reboot_note.why) - 1U] = '\0';
+}
+
 /*
  * Replaces Zephyr's weak default, which halts forever.
  *
@@ -142,11 +165,18 @@ void impulse_fatal_report_boot(void)
 			}
 			used += (size_t)n;
 		}
+		impulse_last_reset_cause = cause;
 		LOG_INF("reset cause: 0x%08x (%s)", cause,
 			used ? names : "none reported");
 		(void)hwinfo_clear_reset_cause();
 	} else {
 		LOG_WRN("reset cause unavailable (%d)", err);
+	}
+
+	if (reboot_note.magic == REBOOT_MAGIC && reboot_note.pending != 0U) {
+		LOG_WRN("PREVIOUS BOOT REBOOTED ITSELF: \"%s\" at uptime %u ms",
+			reboot_note.why, reboot_note.uptime_ms);
+		reboot_note.pending = 0U;
 	}
 
 	if (crash.magic == CRASH_MAGIC && crash.pending != 0U) {

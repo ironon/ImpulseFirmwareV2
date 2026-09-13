@@ -1365,6 +1365,7 @@ int main(void)
 					"— rebooting",
 					now_ms - g_sysworkq_last_run);
 				/* Give the logger a chance to drain. */
+				impulse_note_reboot("sysworkq stalled");
 				k_sleep(K_MSEC(200));
 				sys_reboot(SYS_REBOOT_COLD);
 			}

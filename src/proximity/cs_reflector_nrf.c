@@ -31,6 +31,7 @@
  */
 
 #include "proximity.h"
+#include "../fatal.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -83,6 +84,7 @@ static void rrsp_free_stuck(struct k_timer *t)
 	ARG_UNUSED(t);
 	LOG_ERR("reflector: RRSP free stuck for %d ms — rebooting",
 		RRSP_FREE_STUCK_MS);
+	impulse_note_reboot("RRSP free stuck");
 	sys_reboot(SYS_REBOOT_COLD);
 }
 
