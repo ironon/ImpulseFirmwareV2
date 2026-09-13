@@ -152,6 +152,20 @@ bool impulse_prox_criterion_met(const struct impulse_prox_state *st,
 	}
 }
 
+void impulse_prox_force_away(struct impulse_prox_state *st)
+{
+	if (st == NULL) {
+		return;
+	}
+	st->verdict = IMPULSE_PROX_AWAY;
+	st->have_verdict = true;
+	st->near_run = 0;
+	st->away_run = 0;
+	/* A concluded verdict, not an inability to measure: clear the run so
+	 * the fail-safe does not override it. */
+	st->abstain_run = 0;
+}
+
 /* --- stub backend -------------------------------------------------------- */
 
 static void stub_measure(const uint8_t *anchor_id,
@@ -196,6 +210,14 @@ static const struct impulse_cs_backend *s_backend = &s_stub;
 const struct impulse_cs_backend *impulse_cs_backend(void)
 {
 	return s_backend;
+}
+
+void impulse_cs_link_observe(struct impulse_cs_link_obs *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (s_backend->link_observe != NULL) {
+		s_backend->link_observe(out);
+	}
 }
 
 void impulse_cs_backend_set(const struct impulse_cs_backend *backend)

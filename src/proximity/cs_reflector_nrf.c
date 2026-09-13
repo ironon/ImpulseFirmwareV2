@@ -37,14 +37,122 @@
 #include <zephyr/bluetooth/cs.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/reboot.h>
+#include <bluetooth/services/ras.h>
 
 LOG_MODULE_REGISTER(impulse_cs_refl, LOG_LEVEL_INF);
 
 static bool reflector_enabled;
 
+/*
+ * RRSP INSTANCES ARE ALLOCATED AND FREED HERE, NOT BY NCS.
+ *
+ * CONFIG_BT_RAS_RRSP_AUTO_ALLOC_INSTANCE (off, cs_reflector.conf) frees the
+ * instance from inside the `disconnected` callback, which runs on the SYSTEM
+ * workqueue. bt_ras_rrsp_free() then k_work_queue_drain()s the RRSP queue,
+ * whose send handler can be blocked K_FOREVER allocating from att_pool. ATT
+ * buffers come back via bt_conn_tx_notify, which ALSO runs on the system
+ * workqueue (CONFIG_BT_CONN_TX_NOTIFY_WQ is off) — so the buffer the sender is
+ * waiting for is released only by the thread that is waiting for the sender.
+ * Permanent. Before the sysworkq watchdog it took the anchor off the air for
+ * an hour; after it, it rebooted the anchor ~60 s after every CS link drop,
+ * three times in one Sunrise Lock window (2026-09-12, 23:30).
+ *
+ * Doing the free on a private queue lets the system workqueue finish the
+ * disconnect, release the buffers, and the sender return -ENOTCONN, so the
+ * drain completes. A free that still has not completed after
+ * RRSP_FREE_STUCK_MS means the premise above was wrong; reboot rather than
+ * keep an anchor whose ranging service can never serve again.
+ */
+#define RRSP_FREE_STUCK_MS 20000
+#define RRSP_FREE_WQ_STACK_SIZE 1024
+
+static K_THREAD_STACK_DEFINE(rrsp_free_stack, RRSP_FREE_WQ_STACK_SIZE);
+static struct k_work_q rrsp_free_wq;
+
+struct rrsp_free_slot {
+	struct k_work work;
+	struct k_timer stuck;
+	struct bt_conn *conn; /* holds a reference until the free completes */
+};
+
+static struct rrsp_free_slot rrsp_free_slots[CONFIG_BT_MAX_CONN];
+
+static void rrsp_free_stuck(struct k_timer *t)
+{
+	ARG_UNUSED(t);
+	LOG_ERR("reflector: RRSP free stuck for %d ms — rebooting",
+		RRSP_FREE_STUCK_MS);
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
+static void rrsp_free_handler(struct k_work *w)
+{
+	struct rrsp_free_slot *slot =
+		CONTAINER_OF(w, struct rrsp_free_slot, work);
+	struct bt_conn *conn = slot->conn;
+
+	bt_ras_rrsp_free(conn);
+	k_timer_stop(&slot->stuck);
+	slot->conn = NULL;
+	bt_conn_unref(conn);
+}
+
+static int rrsp_free_init(void)
+{
+	static const struct k_work_queue_config cfg = {
+		.name = "impulse rrsp free",
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(rrsp_free_slots); i++) {
+		k_work_init(&rrsp_free_slots[i].work, rrsp_free_handler);
+		k_timer_init(&rrsp_free_slots[i].stuck, rrsp_free_stuck, NULL);
+	}
+	k_work_queue_init(&rrsp_free_wq);
+	k_work_queue_start(&rrsp_free_wq, rrsp_free_stack,
+			   K_THREAD_STACK_SIZEOF(rrsp_free_stack),
+			   K_PRIO_PREEMPT(10), &cfg);
+	return 0;
+}
+
+SYS_INIT(rrsp_free_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+static void refl_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	ARG_UNUSED(reason);
+
+	for (size_t i = 0; i < ARRAY_SIZE(rrsp_free_slots); i++) {
+		struct rrsp_free_slot *slot = &rrsp_free_slots[i];
+
+		if (slot->conn == NULL) {
+			slot->conn = bt_conn_ref(conn);
+			k_timer_start(&slot->stuck, K_MSEC(RRSP_FREE_STUCK_MS),
+				      K_NO_WAIT);
+			(void)k_work_submit_to_queue(&rrsp_free_wq, &slot->work);
+			return;
+		}
+	}
+
+	/* More pending frees than links can exist: an earlier free never
+	 * finished, and its stuck timer is about to reboot us anyway. */
+	LOG_ERR("reflector: no RRSP free slot — earlier free still pending");
+}
+
 static void refl_connected(struct bt_conn *conn, uint8_t err)
 {
-	if (err != 0U || !reflector_enabled) {
+	if (err != 0U) {
+		return;
+	}
+
+	/* Every link, as the NCS auto-alloc did: the watch is not
+	 * distinguishable from the app until it creates a CS config. */
+	int arc = bt_ras_rrsp_alloc(conn);
+
+	if (arc != 0) {
+		LOG_WRN("reflector: RRSP alloc failed (err %d)", arc);
+	}
+
+	if (!reflector_enabled) {
 		return;
 	}
 
@@ -135,6 +243,7 @@ static void refl_procedure_enabled(struct bt_conn *conn, uint8_t status,
 
 BT_CONN_CB_DEFINE(impulse_refl_conn_cb) = {
 	.connected = refl_connected,
+	.disconnected = refl_disconnected,
 	.le_cs_config_complete = refl_config_complete,
 	.le_cs_security_enable_complete = refl_security_enabled,
 	.le_cs_procedure_enable_complete = refl_procedure_enabled,

@@ -756,6 +756,167 @@ static void test_enforcement_outputs(void)
 	      "phoneAway fail-open stops the motor");
 }
 
+/* ---- lost link = AWAY, and the lost-link grace (v3 §4.5, v0.16) ---------- */
+
+static struct impulse_cs_link_obs link_obs(int64_t activity_ms)
+{
+	struct impulse_cs_link_obs o;
+
+	memset(&o, 0, sizeof(o));
+	o.known = true;
+	o.activity_seen = true;
+	o.last_activity_ms = activity_ms;
+	return o;
+}
+
+/* A getAway window with the alarm running, link healthy at t = 1000 ms. */
+static void alarm_running(struct impulse_enforcement_ctx *c,
+			  const struct impulse_event *e,
+			  struct impulse_cs_link_obs *o)
+{
+	impulse_enforcement_init(c);
+	impulse_enforcement_enter(c, e, 100, false);
+	*o = link_obs(1000);
+	impulse_enforcement_link_update(c, o, 1000, 100);
+	c->prox.have_verdict = true;
+	c->prox.verdict = IMPULSE_PROX_NEAR;
+	(void)impulse_enforcement_check_condition(c, 100, false, NULL, true);
+	(void)impulse_enforcement_tick(c, 100);
+}
+
+static void test_link_loss(void)
+{
+	struct impulse_enforcement_ctx c;
+	struct impulse_cs_link_obs o;
+	struct impulse_event e = mk_event(2, 0, 1440, 0);
+
+	e.criteria = IMPULSE_CRIT_GET_AWAY;
+	e.profile = IMPULSE_PROFILE_STRICT_BOTH;
+
+	/* The whole path: silence inside 2 s, ring stays red, AWAY at 10 s. */
+	alarm_running(&c, &e, &o);
+	CHECK(!c.condition_met && c.profile_run.motor_on,
+	      "link: alarm running before the loss");
+	impulse_enforcement_link_update(&c, &o, 2199, 101);
+	CHECK(!impulse_enforcement_output_silenced(&c),
+	      "link: 1.199 s of silence is not yet a lost link");
+	impulse_enforcement_link_update(&c, &o, 2200, 101);
+	CHECK(impulse_enforcement_output_silenced(&c),
+	      "link: a lost link silences output inside 2 s");
+	CHECK(!c.condition_met,
+	      "link: silenced but still unmet, so the ring stays red");
+	impulse_enforcement_link_update(&c, &o, 10999, 110);
+	CHECK(impulse_enforcement_output_silenced(&c) && !c.condition_met,
+	      "link: 9.999 s lost is still grace, not AWAY");
+	impulse_enforcement_link_update(&c, &o, 11000, 110);
+	CHECK(c.condition_met, "link: 10 s lost concludes AWAY, getAway met");
+	CHECK(c.prox.have_verdict && c.prox.verdict == IMPULSE_PROX_AWAY &&
+	      c.prox.abstain_run == 0,
+	      "link: the verdict is a real AWAY, not the fail-safe");
+	CHECK(!impulse_enforcement_output_silenced(&c) &&
+	      !c.profile_run.motor_on && !c.profile_run.buzzer_on,
+	      "link: output stopped for real once AWAY is concluded");
+
+	/* Cancelled by a noncompliant measurement; stale and far ones don't. */
+	alarm_running(&c, &e, &o);
+	impulse_enforcement_link_update(&c, &o, 2500, 101);
+	CHECK(impulse_enforcement_output_silenced(&c), "grace: opens on loss");
+	o.have_result = true;
+	o.result_ms = 900;
+	o.result_cm = 40;
+	impulse_enforcement_link_update(&c, &o, 2600, 101);
+	CHECK(impulse_enforcement_output_silenced(&c),
+	      "grace: a burst from BEFORE the loss does not end it");
+	o.last_activity_ms = 4000;
+	o.result_ms = 4000;
+	o.result_cm = 500;
+	impulse_enforcement_link_update(&c, &o, 4000, 103);
+	CHECK(impulse_enforcement_output_silenced(&c),
+	      "grace: a FAR measurement does not end it");
+	o.last_activity_ms = 5000;
+	o.result_ms = 5000;
+	o.result_cm = 80;
+	impulse_enforcement_link_update(&c, &o, 5000, 104);
+	CHECK(!impulse_enforcement_output_silenced(&c),
+	      "grace: a noncompliant measurement ends it");
+	(void)impulse_enforcement_tick(&c, 100);
+	CHECK(!c.condition_met && c.profile_run.motor_on,
+	      "grace: and the alarm resumes at once");
+
+	/* Cooldown: no second grace for 2 min, but the 10 s rule still holds. */
+	impulse_enforcement_link_update(&c, &o, 6500, 106);
+	CHECK(!impulse_enforcement_output_silenced(&c),
+	      "cooldown: no second grace inside 2 min of the first");
+	impulse_enforcement_link_update(&c, &o, 14999, 115);
+	CHECK(!c.condition_met, "cooldown: not AWAY before 10 s");
+	impulse_enforcement_link_update(&c, &o, 15000, 115);
+	CHECK(c.condition_met,
+	      "cooldown: 10 s lost is still AWAY during the cooldown");
+
+	c.prox.verdict = IMPULSE_PROX_NEAR; /* walked back in */
+	(void)impulse_enforcement_check_condition(&c, 200, false, NULL, true);
+	o = link_obs(2500 + 120000);
+	impulse_enforcement_link_update(&c, &o, 2500 + 120000, 222);
+	impulse_enforcement_link_update(&c, &o, 2500 + 120000 + 1200, 223);
+	CHECK(impulse_enforcement_output_silenced(&c),
+	      "cooldown: a grace is available again 2 min after the last");
+
+	/* The link came back but produced no measurement in time: AWAY. */
+	alarm_running(&c, &e, &o);
+	impulse_enforcement_link_update(&c, &o, 2500, 101);
+	o.last_activity_ms = 10500; /* activity resumed, no burst yet */
+	impulse_enforcement_link_update(&c, &o, 10999, 110);
+	CHECK(impulse_enforcement_output_silenced(&c) && !c.condition_met,
+	      "grace: link back without a measurement holds the grace");
+	impulse_enforcement_link_update(&c, &o, 11000, 110);
+	CHECK(c.condition_met,
+	      "grace: no noncompliant measurement by 10 s concludes AWAY");
+
+	/* stayNear: no grace, and a lost link FAILS the commitment. */
+	{
+		struct impulse_event s = mk_event(3, 0, 1440, 0);
+
+		s.profile = IMPULSE_PROFILE_STRICT_BOTH;
+		impulse_enforcement_init(&c);
+		impulse_enforcement_enter(&c, &s, 100, false);
+		o = link_obs(1000);
+		impulse_enforcement_link_update(&c, &o, 1000, 100);
+		c.prox.have_verdict = true;
+		c.prox.verdict = IMPULSE_PROX_NEAR;
+		CHECK(impulse_enforcement_check_condition(&c, 100, false, NULL,
+							  true),
+		      "stayNear: near is met");
+		impulse_enforcement_link_update(&c, &o, 2500, 101);
+		CHECK(!impulse_enforcement_output_silenced(&c),
+		      "stayNear: a lost link never opens a grace");
+		impulse_enforcement_link_update(&c, &o, 11000, 110);
+		CHECK(!c.condition_met,
+		      "stayNear: 10 s lost is AWAY, which fails the commitment");
+		(void)impulse_enforcement_tick(&c, 100);
+		CHECK(c.profile_run.motor_on, "stayNear: and the alarm starts");
+	}
+
+	/* Activity from before the window, or none at all, is never a loss. */
+	impulse_enforcement_init(&c);
+	impulse_enforcement_enter(&c, &e, 100, false);
+	o = link_obs(500);
+	impulse_enforcement_link_update(&c, &o, 1000, 100);
+	impulse_enforcement_link_update(&c, &o, 30000, 130);
+	CHECK(!impulse_enforcement_output_silenced(&c) && !c.prox.have_verdict,
+	      "window: activity from before the window is not a lost link");
+	o.activity_seen = false;
+	impulse_enforcement_link_update(&c, &o, 60000, 160);
+	CHECK(!c.prox.have_verdict,
+	      "window: a link that never existed is abstention, not AWAY");
+
+	/* Telemetry-less backends (stub, anchor) are untouched. */
+	alarm_running(&c, &e, &o);
+	o.known = false;
+	impulse_enforcement_link_update(&c, &o, 50000, 150);
+	CHECK(!impulse_enforcement_output_silenced(&c) && !c.condition_met,
+	      "backend: no telemetry, no lost-link rule");
+}
+
 int main(void)
 {
 	printf("impulse host tests\n\n");
@@ -769,6 +930,7 @@ int main(void)
 	test_proximity();
 	test_cs_fuse();
 	test_enforcement_outputs();
+	test_link_loss();
 
 	printf("\n%d checks, %d failed\n", g_run, g_fail);
 	return g_fail == 0 ? 0 : 1;

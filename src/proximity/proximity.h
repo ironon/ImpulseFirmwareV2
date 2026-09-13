@@ -111,6 +111,44 @@ bool impulse_prox_criterion_met(const struct impulse_prox_state *st,
  * force rather than a real verdict. Surfaced so the UI can say so. */
 bool impulse_prox_in_failsafe(const struct impulse_prox_state *st);
 
+/*
+ * LOST LINK = AWAY (v3 §4.5, v0.16 — a product decision, 2026-09-13).
+ *
+ * getAway could not register a user leaving the room: channel sounding needs
+ * the link, so walking out destroys the measurement instead of producing a
+ * large one, and the walk captures show far readings are rare before the link
+ * drops. A sustained loss of the ranging link is therefore concluded as AWAY
+ * directly, bypassing AWAY_DWELL. The enforcement layer owns the timing; this
+ * only installs the verdict. It is NOT a measurement and is never fed through
+ * impulse_prox_ingest(): a single failed connect is still one abstention.
+ */
+void impulse_prox_force_away(struct impulse_prox_state *st);
+
+/*
+ * How long without ANY channel-sounding activity — a procedure result, aborted
+ * or not — counts as the link being lost.
+ *
+ * Deliberately not the BLE disconnect: the CS link's supervision timeout is
+ * 4 s (cs_backend_nrf.c), and the product requirement is that punishment stops
+ * within 2 s of leaving. Procedures arrive at ~8.5/s on a live link even when
+ * three quarters of them abort (measured 2026-09-13), so 1.2 s of silence is
+ * ~10 missing procedures — a dead link, not a slow one — and leaves room for
+ * the 200 ms wait slice and the 100 ms main-loop tick inside the 2 s budget.
+ */
+#define IMPULSE_CS_LINK_LOST_DETECT_MS 1200
+
+/* What the backend can say about the ranging link right now. Uptime ms. */
+struct impulse_cs_link_obs {
+	bool known;            /* false: no telemetry (stub, anchor role) */
+	bool activity_seen;    /* any CS activity since ranging was enabled */
+	int64_t last_activity_ms;
+	bool have_result;      /* a successful burst exists */
+	int64_t result_ms;     /* when it completed */
+	uint32_t result_cm;    /* its true distance */
+};
+
+void impulse_cs_link_observe(struct impulse_cs_link_obs *out);
+
 /* --- backend seam --------------------------------------------------------
  *
  * Everything below is what a real channel-sounding implementation must
@@ -127,6 +165,8 @@ struct impulse_cs_backend {
 	/* Anchor role: begin/stop acting as a reflector. */
 	int (*reflector_start)(void);
 	int (*reflector_stop)(void);
+	/* Optional. NULL reports `known = false`. */
+	void (*link_observe)(struct impulse_cs_link_obs *out);
 };
 
 const struct impulse_cs_backend *impulse_cs_backend(void);

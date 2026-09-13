@@ -3,6 +3,18 @@
 
 #include <string.h>
 
+static void link_reset(struct impulse_enforcement_ctx *ctx)
+{
+	ctx->link_armed = false;
+	ctx->link_window_start_ms = 0;
+	ctx->link_loss_activity_ms = 0;
+	ctx->link_loss_away_applied = false;
+	ctx->link_grace = false;
+	ctx->link_grace_after_ms = 0;
+	ctx->link_grace_deadline_ms = 0;
+	ctx->link_grace_cooldown_until_ms = 0;
+}
+
 void impulse_enforcement_init(struct impulse_enforcement_ctx *ctx)
 {
 	memset(ctx, 0, sizeof(*ctx));
@@ -20,6 +32,7 @@ void impulse_enforcement_enter(struct impulse_enforcement_ctx *ctx,
 	ctx->worn = worn_now;
 	ctx->phone_near_since_utc = 0;
 	ctx->phone_undock_latched = false;
+	link_reset(ctx);
 
 	/* Fresh ranging state per window — no verdict carried in from before
 	 * the commitment started. */
@@ -66,6 +79,7 @@ void impulse_enforcement_exit(struct impulse_enforcement_ctx *ctx)
 	ctx->state = IMPULSE_STATE_DORMANT;
 	ctx->active = NULL;
 	ctx->condition_met = true;
+	link_reset(ctx);
 	impulse_profile_stop(&ctx->profile_run);
 }
 
@@ -242,4 +256,107 @@ uint32_t impulse_enforcement_poll_interval_s(
 
 	return ctx->condition_met ? IMPULSE_ENFORCEMENT_POLL_MET_S
 				  : IMPULSE_ENFORCEMENT_POLL_NOT_MET_S;
+}
+
+static void conclude_away(struct impulse_enforcement_ctx *ctx, int64_t now_utc)
+{
+	ctx->link_grace = false;
+	impulse_prox_force_away(&ctx->prox);
+	/* Settle now rather than on the next poll, so output stops (getAway) or
+	 * starts (stayNear) on this pass. The WiFi and dock arguments are the
+	 * ones main() passes; every anchor-based criterion ignores the WiFi pair. */
+	(void)impulse_enforcement_check_condition(ctx, now_utc, false, NULL,
+						  true);
+}
+
+void impulse_enforcement_link_update(struct impulse_enforcement_ctx *ctx,
+				     const struct impulse_cs_link_obs *obs,
+				     int64_t now_ms, int64_t now_utc)
+{
+	const struct impulse_event *e = ctx->active;
+
+	if (ctx->state != IMPULSE_STATE_ENFORCEMENT || e == NULL ||
+	    !impulse_criteria_is_anchor_based(e->criteria) || obs == NULL ||
+	    !obs->known) {
+		ctx->link_grace = false;
+		return;
+	}
+
+	if (!ctx->link_armed) {
+		ctx->link_armed = true;
+		ctx->link_window_start_ms = now_ms;
+	}
+
+	/* Activity from before this window — the link the previous window was
+	 * releasing — is not a link this window ever had, so it cannot be lost.
+	 * A watch that never connects stays on the abstention path (§4.5). */
+	bool seen = obs->activity_seen &&
+		    obs->last_activity_ms >= ctx->link_window_start_ms;
+	bool lost = seen && (now_ms - obs->last_activity_ms) >=
+				    IMPULSE_CS_LINK_LOST_DETECT_MS;
+
+	/* Met by any other route (donning grace, a real AWAY): nothing left to
+	 * silence. */
+	if (ctx->condition_met) {
+		ctx->link_grace = false;
+	}
+
+	if (lost) {
+		if (ctx->link_loss_activity_ms != obs->last_activity_ms) {
+			/* A new loss. */
+			ctx->link_loss_activity_ms = obs->last_activity_ms;
+			ctx->link_loss_away_applied = false;
+
+			if (e->criteria == IMPULSE_CRIT_GET_AWAY &&
+			    !ctx->condition_met && !ctx->link_grace &&
+			    now_ms >= ctx->link_grace_cooldown_until_ms) {
+				ctx->link_grace = true;
+				ctx->link_grace_after_ms = obs->last_activity_ms;
+				ctx->link_grace_deadline_ms =
+					obs->last_activity_ms +
+					IMPULSE_LINK_LOST_AWAY_MS;
+				ctx->link_grace_cooldown_until_ms =
+					now_ms + IMPULSE_LINK_GRACE_COOLDOWN_MS;
+			}
+		}
+
+		if (!ctx->link_loss_away_applied &&
+		    (now_ms - ctx->link_loss_activity_ms) >=
+			    IMPULSE_LINK_LOST_AWAY_MS) {
+			ctx->link_loss_away_applied = true;
+			conclude_away(ctx, now_utc);
+			return;
+		}
+	} else {
+		ctx->link_loss_activity_ms = 0;
+	}
+
+	if (!ctx->link_grace) {
+		return;
+	}
+
+	/*
+	 * A measurement completed AFTER the loss that is not far enough to be
+	 * AWAY proves the user is still noncompliant: punish again, from the
+	 * start of the profile. A far one does not end the grace — it agrees
+	 * with the conclusion the grace is waiting for.
+	 */
+	if (obs->have_result && obs->result_ms > ctx->link_grace_after_ms &&
+	    obs->result_cm <= ctx->prox.away_enter_cm) {
+		ctx->link_grace = false;
+		impulse_profile_start(&ctx->profile_run, e->profile);
+		return;
+	}
+
+	/* The window closed without a noncompliant measurement — including the
+	 * case where the link came back but produced none, or only far ones. */
+	if (now_ms >= ctx->link_grace_deadline_ms) {
+		conclude_away(ctx, now_utc);
+	}
+}
+
+bool impulse_enforcement_output_silenced(
+	const struct impulse_enforcement_ctx *ctx)
+{
+	return ctx->state == IMPULSE_STATE_ENFORCEMENT && ctx->link_grace;
 }

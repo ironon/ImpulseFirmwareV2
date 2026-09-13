@@ -125,6 +125,36 @@ static K_SEM_DEFINE(sem_distance_estimate_updated, 0, 1);
 static K_SEM_DEFINE(sem_procedures_disabled, 0, 1);
 static atomic_t g_cs_active;
 
+/*
+ * Last channel-sounding activity, for the lost-link rule (v3 §4.5, v0.16).
+ * Stamped on EVERY subevent result, aborted ones included: an aborted
+ * procedure still proves the link is alive, and three quarters of procedures
+ * abort on this pair. Uptime ms truncated to 32 bits so it fits an atomic;
+ * only ever read as an age.
+ */
+static atomic_t g_activity_ms32;
+static atomic_t g_activity_seen;
+
+static inline void note_cs_activity(void)
+{
+	atomic_set(&g_activity_ms32, (atomic_val_t)k_uptime_get_32());
+	atomic_set(&g_activity_seen, 1);
+}
+
+static int64_t cs_last_activity_ms(void)
+{
+	uint32_t age = k_uptime_get_32() - (uint32_t)atomic_get(&g_activity_ms32);
+
+	return k_uptime_get() - (int64_t)age;
+}
+
+static bool cs_link_silent(void)
+{
+	return atomic_get(&g_activity_seen) != 0 &&
+	       (k_uptime_get() - cs_last_activity_ms()) >=
+		       IMPULSE_CS_LINK_LOST_DETECT_MS;
+}
+
 static K_MUTEX_DEFINE(distance_estimate_buffer_mutex);
 
 static struct bt_conn *connection;
@@ -485,6 +515,8 @@ static void ranging_data_cb(struct bt_conn *conn, uint16_t ranging_counter, int 
 
 static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
 {
+	note_cs_activity();
+
 	if (dropped_ranging_counter == result->header.procedure_counter) {
 		return;
 	}
@@ -1098,6 +1130,11 @@ void impulse_cs_set_ranging(bool on)
 		return;
 	}
 	g_ranging_wanted = on;
+	if (on) {
+		/* Activity from the previous window must not read as a link
+		 * this one has already lost. */
+		atomic_set(&g_activity_seen, 0);
+	}
 	apply_ranging_state();
 }
 
@@ -1660,9 +1697,24 @@ static void impulse_cs_measure(const uint8_t *anchor_id,
 	k_mutex_unlock(&impulse_burst_mutex);
 
 	if (!fresh) {
+		/*
+		 * Wait in slices, and give up as soon as the link has gone
+		 * silent. The enforcement loop is blocked in here, and the
+		 * lost-link grace must silence the motor within 2 s of the
+		 * user leaving (v3 §4.5, v0.16) — an 8 s wait on a dead link
+		 * would hold the motor on for the whole of it.
+		 */
+		int64_t until = k_uptime_get() + IMPULSE_CS_MEASURE_WAIT_MS;
+
 		k_sem_reset(&sem_burst_ready);
-		(void)k_sem_take(&sem_burst_ready,
-				 K_MSEC(IMPULSE_CS_MEASURE_WAIT_MS));
+		while (k_uptime_get() < until) {
+			if (k_sem_take(&sem_burst_ready, K_MSEC(200)) == 0) {
+				break;
+			}
+			if (cs_link_silent()) {
+				break;
+			}
+		}
 	}
 
 	k_mutex_lock(&impulse_burst_mutex, K_FOREVER);
@@ -1700,11 +1752,30 @@ static int impulse_cs_reflector_stop(void)
 	return -ENOSYS;
 }
 
+static void impulse_cs_link_observe_nrf(struct impulse_cs_link_obs *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->known = true;
+	out->activity_seen = atomic_get(&g_activity_seen) != 0;
+	if (out->activity_seen) {
+		out->last_activity_ms = cs_last_activity_ms();
+	}
+
+	k_mutex_lock(&impulse_burst_mutex, K_FOREVER);
+	if (impulse_have_result && impulse_last_result.result == IMPULSE_CS_OK) {
+		out->have_result = true;
+		out->result_ms = impulse_last_result_ms;
+		out->result_cm = impulse_last_result.distance_cm;
+	}
+	k_mutex_unlock(&impulse_burst_mutex);
+}
+
 static const struct impulse_cs_backend impulse_nrf_backend = {
 	.name = "nrf-cs-ras",
 	.measure = impulse_cs_measure,
 	.reflector_start = impulse_cs_reflector_start,
 	.reflector_stop = impulse_cs_reflector_stop,
+	.link_observe = impulse_cs_link_observe_nrf,
 };
 
 #define IMPULSE_CS_STACK_SIZE 4096

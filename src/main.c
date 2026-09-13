@@ -1493,9 +1493,52 @@ int main(void)
 			 * Writing unconditionally is two GPIO writes per 100 ms
 			 * tick and makes the whole class of bug unreachable.
 			 */
+			/*
+			 * Lost-link rule and grace (v3 §4.5, v0.16). Every
+			 * pass, not per poll: the grace has a 2 s budget and a
+			 * poll is 10-180 s apart. The ring is deliberately NOT
+			 * gated — it stays red until AWAY is concluded.
+			 */
+			{
+				struct impulse_cs_link_obs obs;
+				bool was_silenced =
+					impulse_enforcement_output_silenced(&g_enf);
+				bool was_met = g_enf.condition_met;
+
+				impulse_cs_link_observe(&obs);
+				impulse_enforcement_link_update(&g_enf, &obs,
+								now_ms,
+								now_utc());
+
+				bool silenced =
+					impulse_enforcement_output_silenced(&g_enf);
+
+				if (silenced && !was_silenced) {
+					LOG_INF("link lost: output silenced, "
+						"AWAY in %u s unless measured near",
+						IMPULSE_LINK_LOST_AWAY_MS / 1000U);
+				} else if (!silenced && was_silenced &&
+					   !g_enf.condition_met) {
+					LOG_INF("link grace ended: measured "
+						"noncompliant, output resumes");
+				}
+				if (!was_met && g_enf.condition_met &&
+				    g_enf.link_loss_away_applied) {
+					LOG_INF("link lost %u s: concluded AWAY",
+						IMPULSE_LINK_LOST_AWAY_MS / 1000U);
+				}
+			}
+
 			(void)impulse_enforcement_tick(&g_enf, dt);
-			impulse_motor_set(g_enf.profile_run.motor_on);
-			impulse_buzzer_set(g_enf.profile_run.buzzer_on);
+			{
+				bool silenced =
+					impulse_enforcement_output_silenced(&g_enf);
+
+				impulse_motor_set(g_enf.profile_run.motor_on &&
+						  !silenced);
+				impulse_buzzer_set(g_enf.profile_run.buzzer_on &&
+						   !silenced);
+			}
 		} else {
 			/*
 			 * NOT ENFORCING => NOTHING DRIVEN. This is a

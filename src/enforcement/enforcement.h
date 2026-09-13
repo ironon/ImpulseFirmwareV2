@@ -58,6 +58,24 @@ enum impulse_state {
  */
 #define IMPULSE_ENFORCEMENT_POLL_ABSTAIN_S 10U
 #define IMPULSE_PHONE_AWAY_TOLERANCE_S     60U
+
+/*
+ * LOST LINK = AWAY, AND THE LOST-LINK GRACE (v3 §4.5, v0.16).
+ *
+ * Product decision, 2026-09-13, over the objection recorded in §4.6: a ranging
+ * link lost for IMPULSE_LINK_LOST_AWAY_MS is concluded as AWAY. For getAway —
+ * Sunrise Lock — that is compliance.
+ *
+ * So that leaving FEELS immediate, getAway also gets a grace: as soon as the
+ * loss is detected (IMPULSE_CS_LINK_LOST_DETECT_MS, inside 2 s) the motor and
+ * buzzer are silenced, but not the LED ring — the criterion is still unmet
+ * until AWAY is concluded. If a measurement inside the window proves the user
+ * is still noncompliant, punishment resumes at once. One grace per
+ * IMPULSE_LINK_GRACE_COOLDOWN_MS, timed from its start; the 10 s rule itself
+ * has no cooldown.
+ */
+#define IMPULSE_LINK_LOST_AWAY_MS      10000
+#define IMPULSE_LINK_GRACE_COOLDOWN_MS 120000
 /* §3.2: wake this far before a boundary and poll into it. Not drift
  * compensation — the LFXO makes drift negligible — but insurance against
  * scheduling jitter, because a boundary missed by any margin is missed
@@ -82,6 +100,18 @@ struct impulse_enforcement_ctx {
 	/* Mode B tolerance — first moment the phone read as near. */
 	int64_t phone_near_since_utc;
 	bool phone_undock_latched;
+
+	/* Lost-link rule and grace. Uptime milliseconds, not wall clock: these
+	 * are sub-second timers, and the uptime is what CS activity is
+	 * stamped with. */
+	bool link_armed;
+	int64_t link_window_start_ms;  /* activity older than this is ignored */
+	int64_t link_loss_activity_ms; /* last activity before this loss; 0 = none */
+	bool link_loss_away_applied;
+	bool link_grace;
+	int64_t link_grace_after_ms;   /* only results newer than this count */
+	int64_t link_grace_deadline_ms;
+	int64_t link_grace_cooldown_until_ms;
 };
 
 void impulse_enforcement_init(struct impulse_enforcement_ctx *ctx);
@@ -106,6 +136,20 @@ bool impulse_enforcement_tick(struct impulse_enforcement_ctx *ctx,
 
 /* Seconds until the next condition poll, honouring the tiered interval. */
 uint32_t impulse_enforcement_poll_interval_s(
+	const struct impulse_enforcement_ctx *ctx);
+
+/*
+ * Apply the lost-link rule. Call EVERY main-loop pass, not only on a poll: the
+ * grace must silence output within 2 s. `now_utc` is only used to settle the
+ * criterion when AWAY is concluded.
+ */
+void impulse_enforcement_link_update(struct impulse_enforcement_ctx *ctx,
+				     const struct impulse_cs_link_obs *obs,
+				     int64_t now_ms, int64_t now_utc);
+
+/* True while the lost-link grace holds the motor and buzzer off. The profile
+ * keeps running underneath; the caller gates the pins, not the ring. */
+bool impulse_enforcement_output_silenced(
 	const struct impulse_enforcement_ctx *ctx);
 
 /* §5.2 worn transitions drive anchor beeping and the donning grace. */

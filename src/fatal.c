@@ -5,6 +5,8 @@
  */
 #include "fatal.h"
 
+#include <string.h>
+
 #include <zephyr/arch/cpu.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/watchdog.h>
@@ -33,7 +35,7 @@ extern void sys_arch_reboot(int type);
  * Retained across a warm reset (.noinit is never zeroed at startup), lost on
  * power loss. A cold boot leaves random RAM, which the magic rejects.
  */
-#define CRASH_MAGIC 0x494D5043U /* "IMPC" */
+#define CRASH_MAGIC 0x494D5044U /* "IMPD": v2 layout, adds fault registers */
 
 struct crash_record {
 	uint32_t magic;
@@ -43,6 +45,17 @@ struct crash_record {
 	uint32_t pc;
 	uint32_t lr;
 	uint32_t uptime_ms;
+	/*
+	 * Where, not just what. On 2026-09-13 the watch took a precise bus
+	 * fault (reason 25) inside memcpy under SEGGER_RTT_WriteSkipNoLock and
+	 * pc/lr alone could not say which address was bad or whose thread it
+	 * was.
+	 */
+	uint32_t cfsr;
+	uint32_t bfar;
+	uint32_t mmfar;
+	uint32_t sp; /* the exception frame, i.e. the faulting stack */
+	char thread[12];
 };
 
 static struct crash_record crash __noinit;
@@ -71,6 +84,17 @@ void k_sys_fatal_error_handler(unsigned int reason,
 	crash.pc = (esf != NULL) ? esf->basic.pc : 0U;
 	crash.lr = (esf != NULL) ? esf->basic.lr : 0U;
 	crash.uptime_ms = (uint32_t)k_uptime_get();
+	crash.cfsr = SCB->CFSR;
+	crash.bfar = SCB->BFAR;
+	crash.mmfar = SCB->MMFAR;
+	crash.sp = (uint32_t)(uintptr_t)esf;
+	{
+		const char *name = k_thread_name_get(k_current_get());
+
+		(void)strncpy(crash.thread, (name != NULL) ? name : "?",
+			      sizeof(crash.thread) - 1U);
+		crash.thread[sizeof(crash.thread) - 1U] = '\0';
+	}
 
 	/* Deferred logging never flushed on 2026-09-12 — the assert text was
 	 * only recovered by reading the RTT buffer out of RAM. Flush now. */
@@ -130,6 +154,9 @@ void impulse_fatal_report_boot(void)
 			"at uptime %u ms (crash #%u since cold boot)",
 			crash.reason, crash.pc, crash.lr, crash.uptime_ms,
 			crash.count);
+		LOG_ERR("  cfsr 0x%08x bfar 0x%08x mmfar 0x%08x sp 0x%08x "
+			"thread '%s'", crash.cfsr, crash.bfar, crash.mmfar,
+			crash.sp, crash.thread);
 		crash.pending = 0U;
 	}
 }
